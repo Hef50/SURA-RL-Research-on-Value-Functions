@@ -50,9 +50,10 @@ class MazeEnv:
             new_row = self.agent_pos[0] + dr
             new_col = self.agent_pos[1] + dc
 
-            # only move if valid open path -> maybe change to fail immediately later
-            if self.maze[new_row, new_col] == 0:
-                self.agent_pos = (new_row, new_col)
+            if 0 <= new_row < self.D and 0 <= new_col < self.D:
+                # only move if valid open path -> maybe change to fail immediately later
+                if self.maze[new_row, new_col] == 0:
+                    self.agent_pos = (new_row, new_col)
         
         if self.steps >= self.max_steps:
             done = True
