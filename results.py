@@ -19,7 +19,7 @@ def run_experiment(encoding_name, encoding_fn, hidden_dim, num_train_mazes=400, 
 
     train_loader = DataLoader(MazeDataset(train_states, train_actions), batch_size=batch_size, shuffle=True)
     input_dim = train_states.shape[1]
-    model = MazeMLP(input_dim=input_dim, hidden_dim=hidden_dim)
+    model = MazeMLP(input_dim=input_dim, hidden_dim=hidden_dim, num_layers=3)
     criterion = nn.CrossEntropyLoss()
     optimizer = optim.Adam(model.parameters(), lr=0.001)
 

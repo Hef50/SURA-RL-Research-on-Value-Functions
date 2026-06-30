@@ -1,4 +1,5 @@
 ﻿import torch
+import torch.nn.functional as F
 import random
 import numpy as np
 from environment import MazeEnv
@@ -34,17 +35,10 @@ def evaluate_random_policy(num_mazes=100, D=5):
     print(f"Random Policy Baseline:")
     print(f"  Success Rate: {success_rate:.1f}%")
     print(f"  Avg Final Distance to Goal: {avg_distance:.2f} cells\n")
+    return success_rate
 
-def evaluate_model_policy(model_path, num_mazes=100, D=5):
-    env = MazeEnv(D=D)
-
-    env.reset()
-    sample_state = encode_as_channels(env.maze, env.agent_pos, env.goal_pos)
-    input_dim = len(sample_state)
-
-    model = MazeMLP(input_dim=input_dim, hidden_dim=128)
-    # torch.load(model_path) -> load saved .pth file from computer mem as state ict
-    model.load_state_dict(torch.load(model_path))
+def evaluate_model_policy_greedy(model, env, encoding_fn, num_mazes=100, max_steps=50):
+    # Evaluates model based on deterministic greedy argmax choices
 
     model.eval()
 
@@ -57,9 +51,12 @@ def evaluate_model_policy(model_path, num_mazes=100, D=5):
             done = False
             steps = 0
 
-            while not done and steps < 20:
-                state_vector = encode_as_channels(env.maze, env.agent_pos, env.goal_pos)
-                state_tensor = torch.tensor(np.array([state_vector]), dtype=torch.float32)
+            while not done and steps < max_steps:
+                # state_vector = encode_as_channels(env.maze, env.agent_pos, env.goal_pos) - MLP
+                state_matrix = encoding_fn(env.maze, env.agent_pos, env.goal_pos)
+                # state_tensor = torch.tensor(np.array([state_vector]), dtype=torch.float32) - MLP
+                state_tensor = torch.tensor(state_matrix, dtype=torch.float32).unsqueeze(0)
+
                 logits = model(state_tensor)
                 action = torch.argmax(logits, dim=1).item()
                 _, _, done = env.step(action)
@@ -68,20 +65,97 @@ def evaluate_model_policy(model_path, num_mazes=100, D=5):
             if done and env.agent_pos == env.goal_pos:
                 successes += 1
             
-            total_final_distance += manhatten_dist(env.agent_pos, env.goal_pos)
+            # total_final_distance += manhatten_dist(env.agent_pos, env.goal_pos)
     
     success_rate = (successes / num_mazes) * 100
-    avg_distance = total_final_distance / num_mazes
+    # avg_distance = total_final_distance / num_mazes
 
-    print(f"Trained MLP Policy Performance:")
-    print(f"  Success Rate: {success_rate:.1f}%")
-    print(f"  Avg Final Distance to Goal: {avg_distance:.2f} cells\n")
+    # print(f"Trained MLP Policy Performance:")
+    # print(f"  Success Rate: {success_rate:.1f}%")
+    # print(f"  Avg Final Distance to Goal: {avg_distance:.2f} cells\n")
 
+    return success_rate
+
+def evaluate_stochastic_pass_k(model, env, encoding_fn, num_mazes=100, N=10, max_steps=50):
+    # Evaluates model by random sampling from its policy probability distribution
+    model.eval()
+
+    # success rates is an array bc its the average pass rate @ k attempts
+    maze_success_rates = [] 
+
+    with torch.no_grad():
+        for _ in range(num_mazes):
+            env.reset()
+            # If env.maze is ever variable, this freezes maze so successive env.reset()s don't create new mazes
+            maze_structure = np.copy(env.maze)
+            start_pos = env.agent_pos
+            goal_pos = env.goal_pos
+            
+            successful_attempts = 0
+            
+            for _ in range(N):
+                # If env.maze is ever variable, this brings back starting pos
+                env.maze = np.copy(maze_structure)
+                env.agent_pos = start_pos
+                env.goal_pos = goal_pos
+                done = False
+                steps = 0
+                
+                while not done and steps < max_steps:
+                    
+                    # [] for (3D^2) -> (1, 3D^2) for batch processing
+                    # np.array for C-style array contiguous memory allocation
+                    # dtype float32 for casting bc that's what model uses
+                    # Tensor object cast to track gradients and do fast matrix multiplication and input to model 
+
+                    # state_vector = encode_as_channels(env.maze, env.agent_pos, env.goal_pos) - MLP
+                    state_matrix = encoding_fn(env.maze, env.agent_pos, env.goal_pos)
+                    # state_tensor = torch.tensor(np.array([state_vector]), dtype=torch.float32) - MLP
+                    state_tensor = torch.tensor(state_matrix, dtype=torch.float32).unsqueeze(0)
+                    logits = model(state_tensor)
+                    
+                    # Convert logits to discrete probability distributions, dim=1 to select actions, not batches (dim=0)
+                    probs = F.softmax(logits, dim=1)
+                    
+                    # Randomly sample an index according to probability array distribution
+                    action = torch.multinomial(probs, num_samples=1).item()
+                    
+                    _, _, done = env.step(action)
+                    steps += 1
+                    
+                if done and env.agent_pos == env.goal_pos:
+                    successful_attempts += 1
+            
+            # Record the execution fraction that reached the target for this maze
+            maze_success_rates.append(successful_attempts / N)
+            
+    return np.mean(maze_success_rates) * 100
 
 
 if __name__ == "__main__":
-    D = 5
-    print("--- Starting Evaluation Arena ---")
-
-    evaluate_random_policy(num_mazes=100, D=5)
-    evaluate_model_policy(model_path="maze_mlp.pth", num_mazes=100, D=5)
+    # Standard 8x8 sandbox arena execution code block for local validation testing
+    D = 8
+    MAX_STEPS = 50
+    HIDDEN_DIM = 128
+    print(f"--- Launching 8x8 Evaluation Arena Context Loop ---")
+    
+    rand_rate = evaluate_random_policy(num_mazes=100, D=D, max_steps=MAX_STEPS)
+    print(f"Random Policy Success: {rand_rate:.1f}%")
+    
+    # Setup baseline model verification structures
+    env = MazeEnv(D=D)
+    env.reset()
+    sample_state = encode_as_channels(env.maze, env.agent_pos, env.goal_pos)
+    
+    model = MazeMLP(input_dim=len(sample_state), hidden_dim=HIDDEN_DIM, num_layers=3)
+    try:
+        model.load_state_dict(torch.load("maze_mlp.pth"))
+        print("Loaded weights from maze_mlp.pth successfully.")
+        
+        greedy_rate = evaluate_model_policy_greedy(model, env, encode_as_channels, num_mazes=100, max_steps=MAX_STEPS)
+        stoch_rate = evaluate_stochastic_pass_k(model, env, encode_as_channels, num_mazes=100, N=10, max_steps=MAX_STEPS)
+        
+        print(f"Greedy Policy Success Rate: {greedy_rate:.1f}%")
+        print(f"Stochastic Pass@10 Success Rate: {stoch_rate:.1f}%")
+    except FileNotFoundError:
+        print("Could not find weights file. Run train.py first to create maze_mlp.pth.")

@@ -7,8 +7,9 @@ import wandb
 
 from environment import MazeEnv
 from bfs_expert import bfs, generate_expert_actions
-from maze_encodings import encode_as_channels, encode_as_single_array
-from model import MazeMLP
+from maze_encodings import encode_as_channels, encode_as_single_array, encode_as_2d_channels
+from model import MazeMLP, MazeCNN
+from evaluate import evaluate_model_policy_greedy, evaluate_stochastic_pass_k
 
 class MazeDataset(Dataset):
     def __init__(self, states, actions):
@@ -46,25 +47,51 @@ def collect_expert_data(num_mazes, D, encoding_fn):
     return torch.tensor(np.array(states), dtype=torch.float32), torch.tensor(np.array(actions), dtype=torch.long)
 
 def train_behavioral_cloning():
-    D = 8
+    D = 10
     EPOCHS = 15 # solid balance for small grids
     BATCH_SIZE = 32 # efficient batch without overloading mem
-    HIDDEN_DIM = 128 # should be enough to learn parmaeters
+    HIDDEN_DIM = 512 # should be enough to learn parmaeters
     LEARNING_RATE = 0.001
-    NUM_TRAIN_MAZES = 400
+    NUM_TRAIN_MAZES = 4000
     NUM_VAL_MAZES = 100 
+    MAX_ROLLOUT_STEPS = 50 
+    NUM_LAYERS = 3
+
+    wandb.init(
+        project="SURA",
+        name=f"BC_CNN_{D}x{D}_hd{HIDDEN_DIM}_data2k",
+        config={                      
+            "grid_size": D,
+            "hidden_dim": HIDDEN_DIM,
+            "num_layers": NUM_LAYERS, 
+            "lr": LEARNING_RATE,
+            "batch_size": BATCH_SIZE,
+            "num_train_mazes": NUM_TRAIN_MAZES,
+            "encoding": "2d-channels",
+            "epochs": EPOCHS,
+        },
+    )
 
     print("Collecting expert BFS solves...")
+
+    # ----- MLP -----
     # train = expert states tensor
-    train_states, train_actions = collect_expert_data(num_mazes=400, D=D, encoding_fn=encode_as_channels)
+    # train_states, train_actions = collect_expert_data(num_mazes=400, D=D, encoding_fn=encode_as_channels)
     # for 80-20 cross-validation
-    val_states, val_actions = collect_expert_data(num_mazes=100, D=D, encoding_fn=encode_as_channels)
+    # val_states, val_actions = collect_expert_data(num_mazes=100, D=D, encoding_fn=encode_as_channels)
+
+    # ----- CNN -----
+    train_states, train_actions = collect_expert_data(num_mazes=2000, D=D, encoding_fn=encode_as_2d_channels)
+    val_states, val_actions = collect_expert_data(num_mazes=100, D=D, encoding_fn=encode_as_2d_channels)
 
     train_loader = DataLoader(MazeDataset(train_states, train_actions), batch_size=BATCH_SIZE, shuffle=True)
     val_loader = DataLoader(MazeDataset(val_states, val_actions), batch_size=BATCH_SIZE, shuffle=False)
 
+    val_env = MazeEnv(D=D)
+
     input_dim = train_states.shape[1]
-    model = MazeMLP(input_dim=input_dim, hidden_dim=HIDDEN_DIM)
+    # model = MazeMLP(input_dim=input_dim, hidden_dim=HIDDEN_DIM, num_layers=NUM_LAYERS)
+    model = MazeCNN(d=D, hidden_dim=HIDDEN_DIM)
 
     criterion = nn.CrossEntropyLoss()
     # Adaptive Moment Estimation, Learning Rate
@@ -120,13 +147,44 @@ def train_behavioral_cloning():
         val_loss = total_val_loss / len(val_states)
         val_acc = (correct_val / len(val_states)) * 100
 
+        print("Executing physical rollout simulations on validation mazes...")
+        greedy_success = evaluate_model_policy_greedy(
+            model=model, 
+            env=val_env, 
+            encoding_fn=encode_as_2d_channels, 
+            num_mazes=50, 
+            max_steps=MAX_ROLLOUT_STEPS
+        )
+
+        stochastic_success = evaluate_stochastic_pass_k(
+            model=model, 
+            env=val_env, 
+            encoding_fn=encode_as_2d_channels, 
+            num_mazes=50, 
+            N=10, 
+            max_steps=MAX_ROLLOUT_STEPS
+        )
+
         # epoch + 1 to number at 1
         # :02d to keep columns aligned to 2 digits
         # .nf = fixed point decimal for n places
         print(f"Epoch {epoch+1:02d}/{EPOCHS} | Train Loss: {train_loss:.4f} Acc: {train_acc:.1f}% | Val Loss: {val_loss:.4f} Acc: {val_acc:.1f}%")
+        print(f"        Rollout Success Rates -> Greedy: {greedy_success:.1f}% | Stochastic Pass@10: {stochastic_success:.1f}%")
+
+        wandb.log({
+            "train_loss": train_loss,
+            "train_acc": train_acc,
+            "val_loss": val_loss,
+            "val_acc": val_acc,
+            "greedy_success_rate": greedy_success,
+            "stochastic_success_rate": stochastic_success,
+            "epoch": epoch + 1
+        })
     
     torch.save(model.state_dict(), "maze_mlp.pth")
     print("Model weights successfully saved to maze_mlp.pth!")
+
+    wandb.finish()
 
 if __name__ == "__main__":
     train_behavioral_cloning()
