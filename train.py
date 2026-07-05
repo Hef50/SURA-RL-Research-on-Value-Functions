@@ -47,19 +47,19 @@ def collect_expert_data(num_mazes, D, encoding_fn):
     return torch.tensor(np.array(states), dtype=torch.float32), torch.tensor(np.array(actions), dtype=torch.long)
 
 def train_behavioral_cloning():
-    D = 10
-    EPOCHS = 15 # solid balance for small grids
+    D = 8
+    EPOCHS = 20 # solid balance for small grids
     BATCH_SIZE = 32 # efficient batch without overloading mem
-    HIDDEN_DIM = 512 # should be enough to learn parmaeters
+    HIDDEN_DIM = 128 # should be enough to learn parmaeters
     LEARNING_RATE = 0.001
-    NUM_TRAIN_MAZES = 4000
+    NUM_TRAIN_MAZES = 10000
     NUM_VAL_MAZES = 100 
     MAX_ROLLOUT_STEPS = 50 
-    NUM_LAYERS = 3
+    NUM_LAYERS = 2
 
     wandb.init(
         project="SURA",
-        name=f"BC_CNN_{D}x{D}_hd{HIDDEN_DIM}_data2k",
+        name=f"BC_CNN_{D}x{D}_hd{HIDDEN_DIM}_data10k",
         config={                      
             "grid_size": D,
             "hidden_dim": HIDDEN_DIM,
@@ -131,6 +131,8 @@ def train_behavioral_cloning():
             preds = torch.argmax(logits, dim=1)
             # sums correctness as int
             correct_train += (preds == batch_actions).sum().item()
+
+            # adds the batch size (or less than the batch size if it's at the end)
             samples_since_last_log += batch_states.size(0)
 
             if global_step % LOG_INTERVAL_STEPS == 0:
@@ -140,6 +142,7 @@ def train_behavioral_cloning():
                 wandb.log({
                     "train_loss_step": current_step_loss,
                     "train_acc_step": current_step_acc,
+                    "total_samples_seen": global_step * BATCH_SIZE,
                     "global_step": global_step
                 })
         
