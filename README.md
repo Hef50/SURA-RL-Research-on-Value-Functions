@@ -4,7 +4,7 @@ A research project investigating **whether learned value functions provide meani
 
 > **Status:** Active research (Summer Undergraduate Research Apprenticeship, June–July 2026). Work in progress.
 > Conducted in [Prof. Andrea Zanette's lab](https://azanette.com/) at Carnegie Mellon University, advised day-to-day by PhD student Daman Arora.
-
+ 
 ---
 
 ## Overview
