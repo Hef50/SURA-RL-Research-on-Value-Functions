@@ -48,7 +48,7 @@ def collect_expert_data(num_mazes, D, encoding_fn):
 
 def train_behavioral_cloning():
     D = 8
-    EPOCHS = 20 # solid balance for small grids
+    EPOCHS = 30 # solid balance for small grids
     BATCH_SIZE = 32 # efficient batch without overloading mem
     HIDDEN_DIM = 128 # should be enough to learn parmaeters
     LEARNING_RATE = 0.001
@@ -59,7 +59,7 @@ def train_behavioral_cloning():
 
     wandb.init(
         project="SURA",
-        name=f"BC_CNN_{D}x{D}_hd{HIDDEN_DIM}_data10k",
+        name=f"BC_MLP_{D}x{D}_hd{HIDDEN_DIM}_data{NUM_TRAIN_MAZES}-2",
         config={                      
             "grid_size": D,
             "hidden_dim": HIDDEN_DIM,
@@ -67,31 +67,33 @@ def train_behavioral_cloning():
             "lr": LEARNING_RATE,
             "batch_size": BATCH_SIZE,
             "num_train_mazes": NUM_TRAIN_MAZES,
-            "encoding": "2d-channels",
+            "encoding": "one-hot-channels",
             "epochs": EPOCHS,
         },
     )
 
     print("Collecting expert BFS solves...")
 
-    # ----- MLP -----
-    # train = expert states tensor
-    # train_states, train_actions = collect_expert_data(num_mazes=400, D=D, encoding_fn=encode_as_channels)
-    # for 80-20 cross-validation
-    # val_states, val_actions = collect_expert_data(num_mazes=100, D=D, encoding_fn=encode_as_channels)
 
-    # ----- CNN -----
-    train_states, train_actions = collect_expert_data(num_mazes=2000, D=D, encoding_fn=encode_as_2d_channels)
-    val_states, val_actions = collect_expert_data(num_mazes=100, D=D, encoding_fn=encode_as_2d_channels)
+    # === PARAMETER SELECTION BLOCK ===
+    # For MLP runs:
+    # train = expert states tensor
+    # for 80-20 cross-validation
+    train_states, train_actions = collect_expert_data(num_mazes=400, D=D, encoding_fn=encode_as_channels)
+    val_states, val_actions = collect_expert_data(num_mazes=100, D=D, encoding_fn=encode_as_channels)
+    eval_encoder = encode_as_channels
+    model = MazeMLP(input_dim=train_states.shape[1], hidden_dim=HIDDEN_DIM, num_layers=NUM_LAYERS)
+
+    # For CNN runs (Uncomment below and comment out above to switch):
+    # train_states, train_actions = collect_expert_data(num_mazes=2000, D=D, encoding_fn=encode_as_2d_channels)
+    # val_states, val_actions = collect_expert_data(num_mazes=100, D=D, encoding_fn=encode_as_2d_channels)
+    # eval_encoder = encode_as_2d_channels
+    # model = MazeCNN(d=D, hidden_dim=HIDDEN_DIM)
 
     train_loader = DataLoader(MazeDataset(train_states, train_actions), batch_size=BATCH_SIZE, shuffle=True)
     val_loader = DataLoader(MazeDataset(val_states, val_actions), batch_size=BATCH_SIZE, shuffle=False)
 
     val_env = MazeEnv(D=D)
-
-    input_dim = train_states.shape[1]
-    # model = MazeMLP(input_dim=input_dim, hidden_dim=HIDDEN_DIM, num_layers=NUM_LAYERS)
-    model = MazeCNN(d=D, hidden_dim=HIDDEN_DIM)
 
     criterion = nn.CrossEntropyLoss()
     # Adaptive Moment Estimation, Learning Rate
@@ -170,7 +172,7 @@ def train_behavioral_cloning():
         greedy_success = evaluate_model_policy_greedy(
             model=model, 
             env=val_env, 
-            encoding_fn=encode_as_2d_channels, 
+            encoding_fn=eval_encoder, # 2d for CNN, channels for MLP
             num_mazes=50, 
             max_steps=MAX_ROLLOUT_STEPS
         )
@@ -178,7 +180,7 @@ def train_behavioral_cloning():
         stochastic_success = evaluate_stochastic_pass_k(
             model=model, 
             env=val_env, 
-            encoding_fn=encode_as_2d_channels, 
+            encoding_fn=eval_encoder, # 2d for CNN, channels for MLP
             num_mazes=50, 
             N=10, 
             max_steps=MAX_ROLLOUT_STEPS
@@ -198,7 +200,7 @@ def train_behavioral_cloning():
             "greedy_success_rate": greedy_success,
             "stochastic_success_rate": stochastic_success,
             "epoch": epoch + 1,
-            "global_step": global_step
+            # "global_step": global_step
         })
     
     torch.save(model.state_dict(), "maze_mlp.pth")
