@@ -97,6 +97,9 @@ def train_behavioral_cloning():
     # Adaptive Moment Estimation, Learning Rate
     optimizer = optim.Adam(model.parameters(), lr = 0.001)
 
+    global_step = 0
+    LOG_INTERVAL_STEPS = 10  # Track and log metrics every 10 gradient steps
+
     print(f"Dataset compiled: {len(train_states)} train steps, {len(val_states)} validation steps.")
     print("Beginning training loop optimization...")
 
@@ -104,6 +107,7 @@ def train_behavioral_cloning():
         model.train()
         total_train_loss = 0
         correct_train = 0
+        samples_since_last_log = 0
 
         for batch_states, batch_actions in train_loader:
             optimizer.zero_grad()
@@ -117,6 +121,7 @@ def train_behavioral_cloning():
             # pointer to logits, which store spointer to hidden layer tensors like model.fc1.weight
             loss.backward()
             optimizer.step()
+            global_step += 1 # incremented bc optimizer step is incremented above
 
             # .item() extracts float loss value 
             # total loss = average loss per sample * number of samaples in batch
@@ -126,6 +131,17 @@ def train_behavioral_cloning():
             preds = torch.argmax(logits, dim=1)
             # sums correctness as int
             correct_train += (preds == batch_actions).sum().item()
+            samples_since_last_log += batch_states.size(0)
+
+            if global_step % LOG_INTERVAL_STEPS == 0:
+                current_step_loss = loss.item()
+                current_step_acc = (preds == batch_actions).float().mean().item() * 100
+
+                wandb.log({
+                    "train_loss_step": current_step_loss,
+                    "train_acc_step": current_step_acc,
+                    "global_step": global_step
+                })
         
         train_loss = total_train_loss / len(train_states)
         train_acc = (correct_train / len(train_states)) * 100
@@ -178,7 +194,8 @@ def train_behavioral_cloning():
             "val_acc": val_acc,
             "greedy_success_rate": greedy_success,
             "stochastic_success_rate": stochastic_success,
-            "epoch": epoch + 1
+            "epoch": epoch + 1,
+            "global_step": global_step
         })
     
     torch.save(model.state_dict(), "maze_mlp.pth")
