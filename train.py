@@ -1,4 +1,5 @@
 ﻿import torch
+import random
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
@@ -11,7 +12,14 @@ from maze_encodings import encode_as_channels, encode_as_single_array, encode_as
 from model import MazeMLP, MazeCNN
 from evaluate import evaluate_model_policy_greedy, evaluate_stochastic_pass_k
 
+# SEED SETTING -- setting a seed so the same code will produce same W&B logs -- comment out if needed
+# seed = 42
+# random.seed(seed)
+# np.random.seed(seed)
+# torch.manual_seed(seed)
+
 class MazeDataset(Dataset):
+    # Inherits from PyTorch Dataset for efficient Neural Net Training
     def __init__(self, states, actions):
         self.states = states
         self.actions = actions
@@ -22,8 +30,8 @@ class MazeDataset(Dataset):
     def __getitem__(self, idx):
         return self.states[idx], self.actions[idx]
 
-def collect_expert_data(num_mazes, D, encoding_fn):
-    env = MazeEnv(D=D)
+def collect_expert_data(num_mazes, D, encoding_fn, max_steps=50):
+    env = MazeEnv(D=D, max_steps=max_steps)
     states = []
     actions = []
 
@@ -31,7 +39,7 @@ def collect_expert_data(num_mazes, D, encoding_fn):
         maze, start, goal = env.reset()
         cell_path = bfs(maze, start, goal)
         
-        if cell_path is None:
+        if cell_path is None: # just in case maze generated is impossible (tho it shouldn't be)
             continue
 
         expert_actions = generate_expert_actions(cell_path)
@@ -40,27 +48,29 @@ def collect_expert_data(num_mazes, D, encoding_fn):
             current_state_vector = encoding_fn(env.maze, env.agent_pos, env.goal_pos)
             # add snapshot to states and actions history list
             states.append(current_state_vector)
-            actions.append(int(action))
+            actions.append(int(action)) # turns action into an int to turn into float later for NN training
             env.step(action)
     
     # returns (states tensor, actions tensor) of experts
+    # floats for states, long ints for action categories
     return torch.tensor(np.array(states), dtype=torch.float32), torch.tensor(np.array(actions), dtype=torch.long)
 
 def train_behavioral_cloning():
     D = 8
-    EPOCHS = 30 # solid balance for small grids
+    # 15 epochs is solid balance for small grids
+    EPOCHS = 1
     BATCH_SIZE = 32 # efficient batch without overloading mem
     HIDDEN_DIM = 128 # should be enough to learn parmaeters
     LEARNING_RATE = 0.001
-    NUM_TRAIN_MAZES = 2000
-    NUM_VAL_MAZES = 100 
-    MAX_ROLLOUT_STEPS = 50 
-    NUM_LAYERS = 2
-    MODEL_TYPE = "MLP"
+    NUM_TRAIN_MAZES = 750
+    NUM_VAL_MAZES = NUM_TRAIN_MAZES // 4 # for 80-20 cross validation
+    MAX_STEPS = 50 
+    NUM_LAYERS = 2 # tunable knob for MLP, hardcoded to 2 for CNNs in current code
+    MODEL_TYPE = "CNN"
 
     wandb.init(
         project="SURA",
-        name=f"BC_{MODEL_TYPE}_{D}x{D}_hd{HIDDEN_DIM}_data{NUM_TRAIN_MAZES}-2",
+        name=f"BC_{MODEL_TYPE}_{D}x{D}_hd{HIDDEN_DIM}_data{NUM_TRAIN_MAZES} -v3",
         config={                      
             "grid_size": D,
             "model-architecture": MODEL_TYPE,
@@ -71,6 +81,7 @@ def train_behavioral_cloning():
             "num_train_mazes": NUM_TRAIN_MAZES,
             "encoding": "one-hot-channels",
             "epochs": EPOCHS,
+            "max_steps": MAX_STEPS
         },
     )
 
@@ -80,13 +91,13 @@ def train_behavioral_cloning():
         # For MLP runs:
         # train = expert states tensor
         # for 80-20 cross-validation
-        train_states, train_actions = collect_expert_data(num_mazes=NUM_TRAIN_MAZES, D=D, encoding_fn=encode_as_channels)
-        val_states, val_actions = collect_expert_data(num_mazes=NUM_VAL_MAZES, D=D, encoding_fn=encode_as_channels)
+        train_states, train_actions = collect_expert_data(num_mazes=NUM_TRAIN_MAZES, D=D, encoding_fn=encode_as_channels, max_steps=MAX_STEPS)
+        val_states, val_actions = collect_expert_data(num_mazes=NUM_VAL_MAZES, D=D, encoding_fn=encode_as_channels, max_steps=MAX_STEPS)
         eval_encoder = encode_as_channels
         model = MazeMLP(input_dim=train_states.shape[1], hidden_dim=HIDDEN_DIM, num_layers=NUM_LAYERS)
     elif MODEL_TYPE == "CNN":
-        train_states, train_actions = collect_expert_data(num_mazes=NUM_TRAIN_MAZES, D=D, encoding_fn=encode_as_2d_channels)
-        val_states, val_actions = collect_expert_data(num_mazes=NUM_VAL_MAZES, D=D, encoding_fn=encode_as_2d_channels)
+        train_states, train_actions = collect_expert_data(num_mazes=NUM_TRAIN_MAZES, D=D, encoding_fn=encode_as_2d_channels, max_steps=MAX_STEPS)
+        val_states, val_actions = collect_expert_data(num_mazes=NUM_VAL_MAZES, D=D, encoding_fn=encode_as_2d_channels, max_steps=MAX_STEPS)
         eval_encoder = encode_as_2d_channels
         model = MazeCNN(d=D, hidden_dim=HIDDEN_DIM)
     else:
@@ -95,7 +106,7 @@ def train_behavioral_cloning():
     train_loader = DataLoader(MazeDataset(train_states, train_actions), batch_size=BATCH_SIZE, shuffle=True)
     val_loader = DataLoader(MazeDataset(val_states, val_actions), batch_size=BATCH_SIZE, shuffle=False)
 
-    val_env = MazeEnv(D=D)
+    val_env = MazeEnv(D=D, max_steps=MAX_STEPS)
 
     criterion = nn.CrossEntropyLoss()
     # Adaptive Moment Estimation, Learning Rate
@@ -131,7 +142,7 @@ def train_behavioral_cloning():
             # total loss = average loss per sample * number of samaples in batch
             total_train_loss += loss.item() * batch_states.size(0)
 
-            # finds top choice, dim =1 -> look horizontally, not vertically (dim=0)
+            # finds top choice, dim =1 -> look horizontally within batches, not vertically across batches (dim=0)
             preds = torch.argmax(logits, dim=1)
             # sums correctness as int
             correct_train += (preds == batch_actions).sum().item()
@@ -174,18 +185,18 @@ def train_behavioral_cloning():
         greedy_success = evaluate_model_policy_greedy(
             model=model, 
             env=val_env, 
-            encoding_fn=eval_encoder, # 2d for CNN, channels for MLP
+            encoding_fn=eval_encoder, 
             num_mazes=50, 
-            max_steps=MAX_ROLLOUT_STEPS
+            max_steps=MAX_STEPS
         )
 
         stochastic_success = evaluate_stochastic_pass_k(
             model=model, 
             env=val_env, 
-            encoding_fn=eval_encoder, # 2d for CNN, channels for MLP
+            encoding_fn=eval_encoder,
             num_mazes=50, 
             N=10, 
-            max_steps=MAX_ROLLOUT_STEPS
+            max_steps=MAX_STEPS
         )
 
         # epoch + 1 to number at 1
@@ -202,7 +213,7 @@ def train_behavioral_cloning():
             "greedy_success_rate": greedy_success,
             "stochastic_success_rate": stochastic_success,
             "epoch": epoch + 1,
-            # "global_step": global_step
+            "global_step": global_step
         })
     
     torch.save(model.state_dict(), f"maze_{MODEL_TYPE}.pth")

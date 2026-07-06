@@ -3,6 +3,7 @@ from maze_generation import generate_maze, place_start_goal
 
 from enum import IntEnum
 
+# Action inherits from IntEnums
 class Action(IntEnum):
     UP = 0
     DOWN = 1
@@ -11,9 +12,9 @@ class Action(IntEnum):
     STOP = 4
 
 class MazeEnv:
-    def __init__(self, D=5):
+    def __init__(self, D=5, max_steps=50):
         self.D = D
-        self.max_steps = 20
+        self.max_steps = max_steps
         self.reset()
     
     def reset(self):
@@ -26,7 +27,7 @@ class MazeEnv:
         return (self.maze, self.agent_pos, self.goal_pos)
 
     def step(self, action):
-        action = Action(action)
+        action = Action(action) # turns number into enum type
 
         self.steps += 1
         reward = 0

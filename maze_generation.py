@@ -2,6 +2,7 @@
 import random 
 import matplotlib.pyplot as plt
 
+# returns list of neighbors 2 steps in each direction within maze boundaries
 def find_neighbors(x, y, D):
     neighbors = []
     directions = [(-2, 0), (2, 0), (0, -2), (0, 2)]
@@ -11,6 +12,7 @@ def find_neighbors(x, y, D):
             neighbors.append((nx, ny))
     return neighbors
 
+# filters neighbords to only in-maze (not a wall)
 def find_in_maze_neighbors(x, y, D, M):
     neighbors = find_neighbors(x, y, D)
     # in_maze_neighbors = []
@@ -32,29 +34,35 @@ def generate_maze(D, seed=None):
     maze[start_x, start_y] = 0 
 
     frontier = []
+    # add neighbors of start to frontier
     frontier.extend(find_neighbors(start_x, start_y, D))
 
     while len(frontier) > 0:
+        # choose a random index from frontier and get its coords
         random_idx = np.random.randint(0, len(frontier))
         fx, fy = frontier.pop(random_idx)
+
+        # if its a wall
         if maze[fx, fy] == 1:
+            # maze it into a non-wall
             maze[fx, fy] = 0
+            # choose a random non-wall and connect them with making the block in between a non-wall
             mx, my = random.choice(find_in_maze_neighbors(fx, fy, D, maze))
             wall_x = (fx + mx) // 2
             wall_y = (fy + my) // 2
             maze[wall_x, wall_y] = 0
+
+            # find neighbors from that chosen non-wall, add it to frontier if wall and not in frontier
             frontier_neighbors = find_neighbors(fx, fy, D)
             for nx, ny in frontier_neighbors:
-                if maze[nx, ny] ==1 and (nx, ny) not in frontier:
+                if maze[nx, ny] == 1 and (nx, ny) not in frontier:
                     frontier.append((nx, ny))
 
     return maze
 
 def simple_visualize(maze, start_pos=None, goal_pos=None):
-    # maze[0, :] = 1        # Top edge
-    # maze[-1, :] = 1       # Bottom edge
-    # maze[:, 0] = 1        # Left edge
-    # maze[:, -1] = 1       # Right edge
+
+    # renders 2D image arraws
     plt.imshow(maze, cmap="binary")
 
     if start_pos is not None:
@@ -73,8 +81,8 @@ def simple_visualize(maze, start_pos=None, goal_pos=None):
     plt.show()
 
 def place_start_goal(maze):
-    open_cells = np.argwhere(maze == 0)
-    open_tuples = [tuple(cell) for cell in open_cells]
+    open_cells = np.argwhere(maze == 0) # returns (row, col) lists where maze[][] == 0
+    open_tuples = [tuple(cell) for cell in open_cells] # turns lists into tuples for safety
     selected = random.sample(open_tuples, 2)
 
     start_pos = selected[0]

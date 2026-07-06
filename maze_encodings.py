@@ -3,7 +3,7 @@
 def encode_as_channels(maze, agent_pos, goal_pos):
     channel_walls = maze.flatten().astype(np.float32)
 
-    agent_grid = np.zeros_like(maze, dtype = np.float32)
+    agent_grid = np.zeros_like(maze, dtype = np.float32) # array with same dimensions as input
     agent_grid[agent_pos[0], agent_pos[1]] = 1.0
     channel_agent = agent_grid.flatten()
 
@@ -22,7 +22,7 @@ def encode_as_single_array(maze, agent_pos, goal_pos):
     return channel
 
 def encode_as_2d_channels(maze, agent_pos, goal_pos):
-    """Returns a 3-channel 2D spatial numpy array of shape (3, D, D)"""
+    # Returns a 3-channel 2D spatial numpy array of shape (3, D, D)
     channel_walls = maze.astype(np.float32)
 
     channel_agent = np.zeros_like(maze, dtype=np.float32)

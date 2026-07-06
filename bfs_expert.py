@@ -5,14 +5,17 @@ def bfs(maze, start, goal):
     start = tuple(start)
     goal = tuple(goal)
 
-    queue = deque([start])
-    visited = {start}
-    parent = {}
+    queue = deque([start]) # double ended queue, puts tuple in list to prevent unwrapping
+    visited = {start} # creates a set -> collection of unique items so we don't go in circles
+    parent = {} # dictionary of cell -> prev
 
     directions = [(-1, 0), (1, 0), (0, -1), (0, 1)]
 
     while len(queue) > 0:
+        # take new item from queue
         current = queue.popleft()
+
+        # if current is the goal, reconstruct path
         if current == goal:
             path = []
             while current in parent:
@@ -26,6 +29,7 @@ def bfs(maze, start, goal):
             nr, nc = current[0] + dr, current[1] + dc
             neighbor = (nr, nc)
             if 0 <= nr < maze.shape[0] and 0 <= nc < maze.shape[1]:
+                # if open cell and not visited, add to queue
                 if maze[nr, nc] == 0 and neighbor not in visited:
                     visited.add(neighbor)
                     parent[neighbor] = current
@@ -33,7 +37,7 @@ def bfs(maze, start, goal):
     return None
 
 def generate_expert_actions(path):
-    if path is None or len(path) < 2:
+    if path is None or len(path) < 2: # if there is no path or path is just starting square
         return [Action.STOP]
     
     actions = []
@@ -45,7 +49,7 @@ def generate_expert_actions(path):
         (0, 1): Action.RIGHT
     }
 
-    for i in range(len(path) - 1):
+    for i in range(len(path) - 1): # len - 1 bc it loops through each element (i) and the next one (i + 1)
         current_cell = path[i]
         next_cell = path[i + 1]
         delta = (next_cell[0] - current_cell[0], next_cell[1] - current_cell[1])
