@@ -52,16 +52,18 @@ def train_behavioral_cloning():
     BATCH_SIZE = 32 # efficient batch without overloading mem
     HIDDEN_DIM = 128 # should be enough to learn parmaeters
     LEARNING_RATE = 0.001
-    NUM_TRAIN_MAZES = 10000
+    NUM_TRAIN_MAZES = 2000
     NUM_VAL_MAZES = 100 
     MAX_ROLLOUT_STEPS = 50 
     NUM_LAYERS = 2
+    MODEL_TYPE = "MLP"
 
     wandb.init(
         project="SURA",
-        name=f"BC_MLP_{D}x{D}_hd{HIDDEN_DIM}_data{NUM_TRAIN_MAZES}-2",
+        name=f"BC_{MODEL_TYPE}_{D}x{D}_hd{HIDDEN_DIM}_data{NUM_TRAIN_MAZES}-2",
         config={                      
             "grid_size": D,
+            "model-architecture": MODEL_TYPE,
             "hidden_dim": HIDDEN_DIM,
             "num_layers": NUM_LAYERS, 
             "lr": LEARNING_RATE,
@@ -74,21 +76,21 @@ def train_behavioral_cloning():
 
     print("Collecting expert BFS solves...")
 
-
-    # === PARAMETER SELECTION BLOCK ===
-    # For MLP runs:
-    # train = expert states tensor
-    # for 80-20 cross-validation
-    train_states, train_actions = collect_expert_data(num_mazes=400, D=D, encoding_fn=encode_as_channels)
-    val_states, val_actions = collect_expert_data(num_mazes=100, D=D, encoding_fn=encode_as_channels)
-    eval_encoder = encode_as_channels
-    model = MazeMLP(input_dim=train_states.shape[1], hidden_dim=HIDDEN_DIM, num_layers=NUM_LAYERS)
-
-    # For CNN runs (Uncomment below and comment out above to switch):
-    # train_states, train_actions = collect_expert_data(num_mazes=2000, D=D, encoding_fn=encode_as_2d_channels)
-    # val_states, val_actions = collect_expert_data(num_mazes=100, D=D, encoding_fn=encode_as_2d_channels)
-    # eval_encoder = encode_as_2d_channels
-    # model = MazeCNN(d=D, hidden_dim=HIDDEN_DIM)
+    if MODEL_TYPE == "MLP":
+        # For MLP runs:
+        # train = expert states tensor
+        # for 80-20 cross-validation
+        train_states, train_actions = collect_expert_data(num_mazes=NUM_TRAIN_MAZES, D=D, encoding_fn=encode_as_channels)
+        val_states, val_actions = collect_expert_data(num_mazes=NUM_VAL_MAZES, D=D, encoding_fn=encode_as_channels)
+        eval_encoder = encode_as_channels
+        model = MazeMLP(input_dim=train_states.shape[1], hidden_dim=HIDDEN_DIM, num_layers=NUM_LAYERS)
+    elif MODEL_TYPE == "CNN":
+        train_states, train_actions = collect_expert_data(num_mazes=NUM_TRAIN_MAZES, D=D, encoding_fn=encode_as_2d_channels)
+        val_states, val_actions = collect_expert_data(num_mazes=NUM_VAL_MAZES, D=D, encoding_fn=encode_as_2d_channels)
+        eval_encoder = encode_as_2d_channels
+        model = MazeCNN(d=D, hidden_dim=HIDDEN_DIM)
+    else:
+        raise ValueError(f"Unknown MODEL_TYPE specified: {MODEL_TYPE}")
 
     train_loader = DataLoader(MazeDataset(train_states, train_actions), batch_size=BATCH_SIZE, shuffle=True)
     val_loader = DataLoader(MazeDataset(val_states, val_actions), batch_size=BATCH_SIZE, shuffle=False)
@@ -203,8 +205,8 @@ def train_behavioral_cloning():
             # "global_step": global_step
         })
     
-    torch.save(model.state_dict(), "maze_mlp.pth")
-    print("Model weights successfully saved to maze_mlp.pth!")
+    torch.save(model.state_dict(), f"maze_{MODEL_TYPE}.pth")
+    print(f"Model weights successfully saved to maze_{MODEL_TYPE}.pth!")
 
     wandb.finish()
 
