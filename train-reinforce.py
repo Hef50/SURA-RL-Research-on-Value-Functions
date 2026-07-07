@@ -20,10 +20,10 @@ def train_reinforce():
     D = 8 # size of maze
     GAMMA = 0.99 # discount factor for future rewards
     LEARNING_RATE = 0.0005 # Lower LR for RL for policy gradient stability
-    TOTAL_EPISODES = 3000 # Total num of envr rollout episodes to train
+    TOTAL_EPISODES = 150 # Total num of envr rollout episodes to train
     MAX_STEPS = 50
-    LOG_INTERVAL = 10 # Log interval to W&B -> every 10 episodes
-    EVAL_INTERVAL = 100 # Evaluate on held-out test mazes every 100 episodes
+    LOG_INTERVAL = 5 # Log interval to W&B -> every 10 episodes
+    EVAL_INTERVAL = 50 # Evaluate on held-out test mazes every 100 episodes
     USE_BASELINE = True # Enable baseline critic value function
     CRITIC_COEFF = 0.1 # downscaling critic's dominance to protect policy learning if needed
     ENTROPY_COEFF = 0.01 # Exploration coefficient (beta) to scale the policy entropy bonus, preventing premature mode collapse
@@ -67,7 +67,7 @@ def train_reinforce():
     # Initialize success tracking window
     success_history = [] 
 
-    print("Beginning on-policy REINFORCE optimization loop...")
+    print("Beginning on-policy RL optimization loop...")
 
     for episode in range(TOTAL_EPISODES):
         model.train() # set to training mode so parameters track autograd updates
@@ -166,7 +166,26 @@ def train_reinforce():
                     policy_losses.append(-lp * adv)
             
             loss = torch.stack(policy_losses).sum() / CURRENT_GROUP_SIZE
-
+        elif ALGORITHM == "MaxRL":
+            R = np.array(group_rewards, dtype=np.float32) 
+            # count successful rollouts in group
+            K = np.sum(R)
+            
+            group_advantages = np.zeros(CURRENT_GROUP_SIZE, dtype=np.float32)
+            for i in range(CURRENT_GROUP_SIZE):
+                if R[i] > 0.0 and K > 0.0:
+                    #  successes are scaled down inversely by how common success was in the group
+                    group_advantages[i] = 1.0 / K
+                else:
+                    # failed traj or batches carry an advantage of 0
+                    group_advantages[i] = 0.0             
+            
+            for i in range(CURRENT_GROUP_SIZE):
+                adv = group_advantages[i]
+                for lp in group_log_probs[i]:
+                    policy_losses.append(-lp * adv)
+            
+            loss = torch.stack(policy_losses).sum() / CURRENT_GROUP_SIZE
         elif ALGORITHM == "REINFORCE":
             rewards = group_rewards[0]   
             log_probs = group_log_probs[0]   
