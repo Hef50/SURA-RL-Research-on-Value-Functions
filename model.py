@@ -1,5 +1,6 @@
 ﻿import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 class MazeMLP(nn.Module):
     def __init__(self, input_dim, hidden_dim=64, num_layers=3):
@@ -42,10 +43,15 @@ class MazeCNN(nn.Module):
         # since padding=1 preserves dimensions, spatial size remains D x D
         self.flattened_dim = 64 * d * d
 
-        # dense projection layers to compute action scores
+        # dense projection layers to compute action scores for the ACTOR
         self.fc1 = nn.Linear(self.flattened_dim, hidden_dim)
         self.relu3 = nn.ReLU()
         self.fc2 = nn.Linear(hidden_dim, 5)
+
+        # New dense projection layer to process the shared convolutional features specifically for the CRITIC
+        self.fc_critic = nn.Linear(self.flattened_dim, hidden_dim) 
+        # Final linear layer to collapse the critic's hidden features into a single continuous scalar state-value prediction
+        self.value_head = nn.Linear(hidden_dim, 1) 
 
     def forward(self, x):
         out = self.relu1(self.conv1(x))
@@ -56,7 +62,12 @@ class MazeCNN(nn.Module):
         # -1 flag tells it to figure out math automatically for rest of tensors
         out = out.view(out.size(0), -1)
 
-        # MLP classification
-        out = self.relu3(self.fc1(out))
-        logits = self.fc2(out)
-        return logits
+        # MLP classification for Actor
+        actor_out = self.relu3(self.fc1(out))
+        logits = self.fc2(actor_out)
+
+        # Critic evaluation
+        critic_out = F.relu(self.fc_critic(out))
+        state_value = self.value_head(critic_out)
+
+        return logits, state_value

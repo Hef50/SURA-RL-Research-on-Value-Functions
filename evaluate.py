@@ -64,7 +64,7 @@ def evaluate_model_policy_greedy(model, env, encoding_fn, num_mazes=100, max_ste
                 else:
                     raise ValueError(f"Unknown MODEL_TYPE specified: {modeltype}")
 
-                logits = model(state_tensor)
+                logits, _ = model(state_tensor)
                 action = torch.argmax(logits, dim=1).item()
                 _, _, done = env.step(action)
                 steps += 1
@@ -125,7 +125,7 @@ def evaluate_stochastic_pass_k(model, env, encoding_fn, num_mazes=100, N=10, max
                     else:
                         raise ValueError(f"Unknown MODEL_TYPE specified: {modeltype}")
                     
-                    logits = model(state_tensor)
+                    logits, _ = model(state_tensor)
                     
                     # Convert logits to discrete probability distributions, dim=1 to select actions, not batches (dim=0)
                     probs = F.softmax(logits, dim=1)
@@ -187,7 +187,7 @@ def evaluate_stochastic_mean_k(model, env, encoding_fn, num_mazes=100, N=10, max
                     else:
                         raise ValueError(f"Unknown MODEL_TYPE specified: {modeltype}")
                     
-                    logits = model(state_tensor)
+                    logits, _ = model(state_tensor)
                     
                     # Convert logits to discrete probability distributions, dim=1 to select actions, not batches (dim=0)
                     probs = F.softmax(logits, dim=1)

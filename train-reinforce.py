@@ -24,16 +24,20 @@ def train_reinforce():
     MAX_STEPS = 50
     LOG_INTERVAL = 10 # Log interval to W&B -> every 10 episodes
     EVAL_INTERVAL = 100 # Evaluate on held-out test mazes every 100 episodes
+    USE_BASELINE = True # Enable baseline critic value function
+    CRITIC_COEFF = 0.5 # downscaling critic's dominance to protect policy learning if needed
 
     wandb.init(
         project="SURA",
-        name=f"RL_Vanilla_REINFORCE_{D}x{D}",
+        name=f"RL_{f'REINFORCE_Baseline_CC:{CRITIC_COEFF}' if USE_BASELINE else 'Vanilla_REINFORCE'}_{D}x{D}",
         config={
             "grid_size": D,
-            "algorithm": "Vanilla REINFORCE",
+            "algorithm": "REINFORCE with Baseline" if USE_BASELINE else "Vanilla REINFORCE",
             "gamma": GAMMA,
             "lr": LEARNING_RATE,
-            "max_steps": MAX_STEPS
+            "max_steps": MAX_STEPS,
+            "use_baseline": USE_BASELINE,
+            "critic_coeff": CRITIC_COEFF if USE_BASELINE else 0.0 
         }
     )
 
@@ -44,7 +48,8 @@ def train_reinforce():
     model = MazeCNN(d=D, hidden_dim=128).to(device)
 
     # Loads model to VRAM
-    model.load_state_dict(torch.load("BFS_BC_CNN-RL-starter.pth", map_location=device)) 
+    # Strict=false acknowledges that starter doesn't have values for fc_critic, etc. but that's okay
+    model.load_state_dict(torch.load("BFS_BC_CNN-RL-starter.pth", map_location=device), strict=False) 
     print("Loaded warm-start maze_CNN baseline.")
 
     optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE)
@@ -59,7 +64,7 @@ def train_reinforce():
         model.train() # set to training mode so parameters track autograd updates
         env.reset()
         done = False # boolean completion tracker managed by maze environment
-        states, actions, log_probs, rewards, entropies = [], [], [], [], []
+        states, actions, log_probs, rewards, entropies, state_values = [], [], [], [], [], []
 
         steps = 0 # track local time steps to give MAX_STEPS cutoff
 
@@ -71,7 +76,7 @@ def train_reinforce():
             # Allocate input tensor array to GPU before running the forward pass
             state_tensor = torch.tensor(state_matrix, dtype=torch.float32).unsqueeze(0).to(device)
 
-            logits = model(state_tensor)
+            logits, state_value = model(state_tensor)
 
             # softmax with dim -1 to choose the last index since logits is (1, 5) 
             probs = F.softmax(logits, dim=-1)
@@ -91,6 +96,7 @@ def train_reinforce():
             log_probs.append(log_prob)
             rewards.append(reward)
             entropies.append(entropy)
+            state_values.append(state_value)
 
             steps += 1
         
@@ -105,19 +111,33 @@ def train_reinforce():
             discounted_returns.insert(0, G)
         
         discounted_returns = torch.tensor(discounted_returns, dtype=torch.float32).to(device)
+        # Concatenate the list of single-item value tensors of dimension (1,1)
+        # into a continuous 1D tensor vector to align dimensionally with the discounted returns 
+        state_values = torch.cat(state_values).squeeze(-1) 
+        
 
         policy_loss = []
+        value_loss = []
 
         # Zip collects together logprob and its corresponding return into tuples
-        for log_prob, G_t in zip(log_probs, discounted_returns):
+        for log_prob, G_t, V_s in zip(log_probs, discounted_returns, state_values):
+            if USE_BASELINE:
+                advantage = G_t - V_s.item()
+                value_loss.append(F.mse_loss(V_s, torch.tensor(G_t, device=device)))
+            else:
+                advantage = G_t
+            
             # since loss = -pi_theta(a_t | s_t) * G_t from policy gradient theorem
-            policy_loss.append(-log_prob * G_t)
+            policy_loss.append(-log_prob * advantage)
         
         # CONVENIENCE: torch turns python list into 1D tensor of size (15) so we can call convenient .sum() function
         # IMPORTANCE: creates a master 'StackBackward' intersection node in the computational graph, allowing the trace backward:
         # loss -> sumbackward from sum -> stackbackward from stack -> mulbackward from log_prob * G_t -> categorical from dist
         # -> dist -> probs -> softmax -> logits -> model -> weights
         loss = torch.stack(policy_loss).sum()
+        if USE_BASELINE:
+            # Sharing loss backprop for efficiency, learning the same representation of the maze
+            loss += CRITIC_COEFF * torch.stack(value_loss).sum()
 
         optimizer.zero_grad()
         loss.backward()
@@ -167,7 +187,7 @@ def train_reinforce():
                 modeltype="CNN"
             )
 
-            print(f"Validation Rates -> Greedy: {val_greedy_rate:.1f}% | Stochastic Pass@10: {val_pass_k:.1f}%\n")
+            print(f"Validation Rates -> Greedy: {val_greedy_rate:.1f}% | Stochastic Pass@10: {val_pass_k:.1f}% | Stochastic Mean@1: {val_mean_1:.1f}%\n")
 
             wandb.log({
                 "val_greedy_success_rate": val_greedy_rate,
@@ -179,11 +199,15 @@ def train_reinforce():
         if global_step % LOG_INTERVAL == 0:
             print(f"Episode {global_step:04d} | Reward: {episode_reward:.2f} | Rolling Success: {rolling_success_rate:.1f}% | Steps: {steps} | Entropy: {mean_entropy:.4f}")
 
+            # Critic Loss
+            c_loss = torch.stack(value_loss).sum().item() if USE_BASELINE else 0.0
+
             wandb.log({
                 "mean_reward": episode_reward,
                 "rolling_train_success_rate": rolling_success_rate,
                 "response_length": steps,
                 "policy_entropy": mean_entropy,
+                "critic_value_loss": c_loss,
                 "global_step": global_step
             })
     
