@@ -9,7 +9,7 @@ from tkinter import ttk
 
 from environment import MazeEnv
 from model import MazeMLP
-from train import collect_expert_data, MazeDataset
+from train_behavior_cloning import collect_expert_data, MazeDataset
 from evaluate import manhatten_dist, evaluate_random_policy
 from maze_encodings import encode_as_channels, encode_as_single_array
 

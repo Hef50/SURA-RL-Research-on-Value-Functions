@@ -187,7 +187,8 @@ def train_behavioral_cloning():
             env=val_env, 
             encoding_fn=eval_encoder, 
             num_mazes=50, 
-            max_steps=MAX_STEPS
+            max_steps=MAX_STEPS,
+            modeltype=MODEL_TYPE
         )
 
         stochastic_success = evaluate_stochastic_pass_k(
@@ -196,7 +197,8 @@ def train_behavioral_cloning():
             encoding_fn=eval_encoder,
             num_mazes=50, 
             N=10, 
-            max_steps=MAX_STEPS
+            max_steps=MAX_STEPS,
+            modeltype=MODEL_TYPE
         )
 
         # epoch + 1 to number at 1

@@ -9,8 +9,8 @@ from model import MazeMLP
 def manhatten_dist(pos_x, pos_y):
     return abs(pos_x[0] - pos_y[0]) + abs(pos_x[1] - pos_y[1])
 
-def evaluate_random_policy(num_mazes=100, D=5):
-    env = MazeEnv(D=D)
+def evaluate_random_policy(num_mazes=100, D=5, max_steps=50):
+    env = MazeEnv(D=D, max_steps=max_steps)
     successes = 0
     total_final_distance = 0
 
@@ -19,7 +19,7 @@ def evaluate_random_policy(num_mazes=100, D=5):
         done = False
         steps = 0
         
-        while not done and steps < 20:
+        while not done and steps < max_steps:
             random_action = random.randint(0, 4)
             _, _, done = env.step(random_action)
             steps += 1
@@ -37,9 +37,8 @@ def evaluate_random_policy(num_mazes=100, D=5):
     print(f"  Avg Final Distance to Goal: {avg_distance:.2f} cells\n")
     return success_rate
 
-def evaluate_model_policy_greedy(model, env, encoding_fn, num_mazes=100, max_steps=50):
+def evaluate_model_policy_greedy(model, env, encoding_fn, num_mazes=100, max_steps=50, modeltype="CNN"):
     # Evaluates model based on deterministic greedy argmax choices
-
     model.eval()
 
     successes = 0
@@ -51,11 +50,15 @@ def evaluate_model_policy_greedy(model, env, encoding_fn, num_mazes=100, max_ste
             done = False
             steps = 0
 
-            while not done and steps < max_steps:
-                # state_vector = encode_as_channels(env.maze, env.agent_pos, env.goal_pos) - MLP
-                state_matrix = encoding_fn(env.maze, env.agent_pos, env.goal_pos)
-                # state_tensor = torch.tensor(np.array([state_vector]), dtype=torch.float32) - MLP
-                state_tensor = torch.tensor(state_matrix, dtype=torch.float32).unsqueeze(0)
+            while not done and steps < max_steps:  
+                if modeltype == "MLP":
+                    state_vector = encode_as_channels(env.maze, env.agent_pos, env.goal_pos)
+                    state_tensor = torch.tensor(np.array([state_vector]), dtype=torch.float32)
+                elif modeltype == "CNN":
+                    state_matrix = encoding_fn(env.maze, env.agent_pos, env.goal_pos)
+                    state_tensor = torch.tensor(state_matrix, dtype=torch.float32).unsqueeze(0)
+                else:
+                    raise ValueError(f"Unknown MODEL_TYPE specified: {modeltype}")
 
                 logits = model(state_tensor)
                 action = torch.argmax(logits, dim=1).item()
@@ -76,7 +79,7 @@ def evaluate_model_policy_greedy(model, env, encoding_fn, num_mazes=100, max_ste
 
     return success_rate
 
-def evaluate_stochastic_pass_k(model, env, encoding_fn, num_mazes=100, N=10, max_steps=50):
+def evaluate_stochastic_pass_k(model, env, encoding_fn, num_mazes=100, N=10, max_steps=50, modeltype="CNN"):
     # Evaluates model by random sampling from its policy probability distribution
     model.eval()
 
@@ -102,16 +105,20 @@ def evaluate_stochastic_pass_k(model, env, encoding_fn, num_mazes=100, N=10, max
                 steps = 0
                 
                 while not done and steps < max_steps:
-                    
-                    # [] for (3D^2) -> (1, 3D^2) for batch processing
+                    # [] for (3D^2) -> (1, 3D^2) for batch processing with unsqueeze
                     # np.array for C-style array contiguous memory allocation
                     # dtype float32 for casting bc that's what model uses
                     # Tensor object cast to track gradients and do fast matrix multiplication and input to model 
 
-                    # state_vector = encode_as_channels(env.maze, env.agent_pos, env.goal_pos) - MLP
-                    state_matrix = encoding_fn(env.maze, env.agent_pos, env.goal_pos)
-                    # state_tensor = torch.tensor(np.array([state_vector]), dtype=torch.float32) - MLP
-                    state_tensor = torch.tensor(state_matrix, dtype=torch.float32).unsqueeze(0)
+                    if modeltype == "MLP":
+                        state_vector = encode_as_channels(env.maze, env.agent_pos, env.goal_pos)
+                        state_tensor = torch.tensor(np.array([state_vector]), dtype=torch.float32)
+                    elif modeltype == "CNN":
+                        state_matrix = encoding_fn(env.maze, env.agent_pos, env.goal_pos)
+                        state_tensor = torch.tensor(state_matrix, dtype=torch.float32).unsqueeze(0)
+                    else:
+                        raise ValueError(f"Unknown MODEL_TYPE specified: {modeltype}")
+                    
                     logits = model(state_tensor)
                     
                     # Convert logits to discrete probability distributions, dim=1 to select actions, not batches (dim=0)
@@ -143,7 +150,7 @@ if __name__ == "__main__":
     print(f"Random Policy Success: {rand_rate:.1f}%")
     
     # Setup baseline model verification structures
-    env = MazeEnv(D=D)
+    env = MazeEnv(D=D, max_steps=MAX_STEPS)
     env.reset()
     sample_state = encode_as_channels(env.maze, env.agent_pos, env.goal_pos)
     
