@@ -25,7 +25,8 @@ def train_reinforce():
     LOG_INTERVAL = 10 # Log interval to W&B -> every 10 episodes
     EVAL_INTERVAL = 100 # Evaluate on held-out test mazes every 100 episodes
     USE_BASELINE = True # Enable baseline critic value function
-    CRITIC_COEFF = 0.5 # downscaling critic's dominance to protect policy learning if needed
+    CRITIC_COEFF = 0.1 # downscaling critic's dominance to protect policy learning if needed
+    ENTROPY_COEFF = 0.01 # Exploration coefficient (beta) to scale the policy entropy bonus, preventing premature mode collapse
 
     wandb.init(
         project="SURA",
@@ -37,7 +38,8 @@ def train_reinforce():
             "lr": LEARNING_RATE,
             "max_steps": MAX_STEPS,
             "use_baseline": USE_BASELINE,
-            "critic_coeff": CRITIC_COEFF if USE_BASELINE else 0.0 
+            "critic_coeff": CRITIC_COEFF if USE_BASELINE else 0.0,
+            "entropy_coeff": ENTROPY_COEFF
         }
     )
 
@@ -138,6 +140,7 @@ def train_reinforce():
         if USE_BASELINE:
             # Sharing loss backprop for efficiency, learning the same representation of the maze
             loss += CRITIC_COEFF * torch.stack(value_loss).sum()
+        loss -= ENTROPY_COEFF * torch.stack(entropies).sum()
 
         optimizer.zero_grad()
         loss.backward()
