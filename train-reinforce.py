@@ -28,11 +28,11 @@ def train_reinforce():
     CRITIC_COEFF = 0.1 # downscaling critic's dominance to protect policy learning if needed
     ENTROPY_COEFF = 0.01 # Exploration coefficient (beta) to scale the policy entropy bonus, preventing premature mode collapse
 
-    ALGORITHM = "RLOO"
+    ALGORITHM = "GRPO"
     GROUP_SIZE = 4
 
-    run_name = f"RL_{ALGORITHM}_G{GROUP_SIZE}_{D}x{D}" if ALGORITHM == "RLOO" else f"RL_{'REINFORCE_Baseline_CC:' + str(CRITIC_COEFF) if USE_BASELINE else 'Vanilla_REINFORCE'}_{D}x{D}"
-    algo_config = ALGORITHM if ALGORITHM == "RLOO" else ("REINFORCE_Baseline" if USE_BASELINE else "Vanilla_REINFORCE")
+    run_name = f"RL_{ALGORITHM}_G{GROUP_SIZE}_{D}x{D}" if ALGORITHM != "REINFORCE" else f"RL_{'REINFORCE_Baseline_CC:' + str(CRITIC_COEFF) if USE_BASELINE else 'Vanilla_REINFORCE'}_{D}x{D}"
+    algo_config = ALGORITHM if ALGORITHM != "REINFORCE" else ("REINFORCE_Baseline" if USE_BASELINE else "Vanilla_REINFORCE")
 
     wandb.init(
         project="SURA",
@@ -40,7 +40,7 @@ def train_reinforce():
         config={
             "grid_size": D,
             "algorithm": algo_config,
-            "group_size": GROUP_SIZE if ALGORITHM == "RLOO" else 1,
+            "group_size": GROUP_SIZE if ALGORITHM != "REINFORCE" else 1,
             "gamma": GAMMA,
             "lr": LEARNING_RATE,
             "max_steps": MAX_STEPS,
@@ -81,7 +81,7 @@ def train_reinforce():
         group_rewards = [] # stores the accumulated terminal total reward for each group rollout
         group_entropies = [] # stores lists of action selection entropies across the group
         group_state_values = [] # Tracked for REINFORCE with baseline for backwards compatibility
-        CURRENT_GROUP_SIZE = GROUP_SIZE if ALGORITHM == "RLOO" else 1
+        CURRENT_GROUP_SIZE = GROUP_SIZE if ALGORITHM != "REINFORCE" else 1
 
         for g in range(CURRENT_GROUP_SIZE):
             env.maze = np.copy(maze_structure) # Restores frozen maze obstacle
@@ -150,6 +150,23 @@ def train_reinforce():
                     policy_losses.append(-lp * adv)
             
             loss = torch.stack(policy_losses).sum() / CURRENT_GROUP_SIZE
+        elif ALGORITHM == "GRPO":
+            R = np.array(group_rewards, dtype=np.float32) 
+            group_mean = np.mean(R)
+            group_std = np.std(R) 
+            
+            group_advantages = np.zeros(CURRENT_GROUP_SIZE, dtype=np.float32)
+            for i in range(CURRENT_GROUP_SIZE):
+                # apply z-score standardization + add a 1e-8 epsilon to prevent dividing by 0
+                group_advantages[i] = (R[i] - group_mean) / (group_std + 1e-8)
+            
+            for i in range(CURRENT_GROUP_SIZE):
+                adv = group_advantages[i]
+                for lp in group_log_probs[i]:
+                    policy_losses.append(-lp * adv)
+            
+            loss = torch.stack(policy_losses).sum() / CURRENT_GROUP_SIZE
+
         elif ALGORITHM == "REINFORCE":
             rewards = group_rewards[0]   
             log_probs = group_log_probs[0]   
@@ -269,8 +286,8 @@ def train_reinforce():
                 "global_step": global_step
             })
     
-    torch.save(model.state_dict(),"maze_REINFORCE.pth")
-    print("Vanilla REINFORCE training complete. Weights saved successfully!")
+    torch.save(model.state_dict(),f"maze_{ALGORITHM}.pth")
+    print(f"{ALGORITHM} training complete. Weights saved successfully!")
 
     wandb.finish()
 
