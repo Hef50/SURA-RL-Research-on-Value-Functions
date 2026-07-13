@@ -19,16 +19,16 @@ def train_reinforce():
     # -- HYPERPARAMETERS --
     D = 8 # size of maze
     GAMMA = 0.99 # discount factor for future rewards
-    LEARNING_RATE = 0.0005 # Lower LR for RL for policy gradient stability
-    TOTAL_EPISODES = 150 # Total num of envr rollout episodes to train
-    MAX_STEPS = 50
-    LOG_INTERVAL = 5 # Log interval to W&B -> every 10 episodes
+    LEARNING_RATE = 3e-6 # Lower LR for RL for policy gradient stability
+    TOTAL_EPISODES = 200 # Total num of envr rollout episodes to train
+    MAX_STEPS = 70
+    LOG_INTERVAL = 10 # Log interval to W&B -> every 10 episodes
     EVAL_INTERVAL = 50 # Evaluate on held-out test mazes every 100 episodes
     USE_BASELINE = True # Enable baseline critic value function
     CRITIC_COEFF = 0.1 # downscaling critic's dominance to protect policy learning if needed
     ENTROPY_COEFF = 0.01 # Exploration coefficient (beta) to scale the policy entropy bonus, preventing premature mode collapse
 
-    ALGORITHM = "GRPO"
+    ALGORITHM = "MaxRL"
     GROUP_SIZE = 4
 
     run_name = f"RL_{ALGORITHM}_G{GROUP_SIZE}_{D}x{D}" if ALGORITHM != "REINFORCE" else f"RL_{'REINFORCE_Baseline_CC:' + str(CRITIC_COEFF) if USE_BASELINE else 'Vanilla_REINFORCE'}_{D}x{D}"
@@ -119,8 +119,9 @@ def train_reinforce():
                 _, reward, done = env.step(action.item())
 
                 # Append values to trajectory
+                step_penalty = -0.005 if not done else 0.0
                 log_probs.append(log_prob)
-                rewards.append(reward)
+                rewards.append(reward + step_penalty)
                 entropies.append(entropy)
                 if ALGORITHM == "REINFORCE" and USE_BASELINE:
                     state_values.append(state_value)

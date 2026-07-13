@@ -97,16 +97,16 @@ def evaluate_stochastic_pass_k(model, env, encoding_fn, num_mazes=100, N=10, max
             env.reset()
             # If env.maze is ever variable, this freezes maze so successive env.reset()s don't create new mazes
             maze_structure = np.copy(env.maze)
-            start_pos = env.agent_pos
-            goal_pos = env.goal_pos
+            start_pos = tuple(env.agent_pos)
+            goal_pos = tuple(env.goal_pos)
 
             maze_solved = False
             
             for _ in range(N):
                 # If env.maze is ever variable, this brings back starting pos
                 env.maze = np.copy(maze_structure)
-                env.agent_pos = start_pos
-                env.goal_pos = goal_pos
+                env.agent_pos = list(start_pos)
+                env.goal_pos = list(goal_pos)
                 done = False
                 steps = 0
                 
