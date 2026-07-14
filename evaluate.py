@@ -45,7 +45,8 @@ def evaluate_random_policy(num_mazes=100, D=5, max_steps=50):
     print(f"  Avg Final Distance to Goal: {avg_distance:.2f} cells\n")
     return success_rate
 
-def evaluate(model, env, encoding_fn, num_mazes=100, mode=EvalMode.GREEDY, N=10, max_steps=50, modeltype="CNN", fixed_mazes=None):
+def evaluate(model, env, encoding_fn, num_mazes=100, mode=EvalMode.GREEDY,
+             N=10, max_steps=50, modeltype="CNN", fixed_mazes=None, return_stats=False):
     # Unified Evaluation Function to evaluate deterministic (Greedy) and stochastic (Pass@k, Mean@k) rollouts cleanly
     model.eval()
     
@@ -57,6 +58,10 @@ def evaluate(model, env, encoding_fn, num_mazes=100, mode=EvalMode.GREEDY, N=10,
     successful_mazes = 0
     # Tracks fractional rollout successes for Mean@k
     maze_success_rates = []
+    timeout_rollouts = 0      # ended by hitting max_steps (loop / never STOP)
+    wrong_stop_rollouts = 0   # issued STOP off-goal
+    solved_rollouts = 0
+    total_rollouts_counted = 0
 
     # Greedy only requires a single deterministic attempt per maze
     rollouts_per_maze = 1 if mode == EvalMode.GREEDY else N
@@ -121,23 +126,38 @@ def evaluate(model, env, encoding_fn, num_mazes=100, mode=EvalMode.GREEDY, N=10,
                     _, _, done = env.step(action)
                     steps += 1
                     
-                if done and tuple(env.agent_pos) == goal_pos:
+                solved = done and tuple(env.agent_pos) == goal_pos
+                total_rollouts_counted += 1
+                if solved:
+                    solved_rollouts += 1
                     maze_solved_any = True
                     successful_attempts += 1
-                    
-                    # Pass@k only needs 1 solve to succeed, so we can save compute time and break early
                     if mode == EvalMode.PASS_K:
                         break
+                elif steps >= max_steps:
+                    timeout_rollouts += 1      # loop / never emitted STOP
+                else:
+                    wrong_stop_rollouts += 1   # STOPped in the wrong cell
+
             
             if mode == EvalMode.MEAN_K:
                 maze_success_rates.append(successful_attempts / rollouts_per_maze)
             elif maze_solved_any:
                 successful_mazes += 1
     
-    if mode == EvalMode.MEAN_K:
-        return np.mean(maze_success_rates) * 100
-    else:
-        return (successful_mazes / n) * 100
+    rate = (np.mean(maze_success_rates) * 100
+        if mode == EvalMode.MEAN_K
+        else (successful_mazes / n) * 100)
+    if return_stats:
+        denom = max(total_rollouts_counted, 1)
+        return {
+            "rate": rate,
+            "timeout_frac": timeout_rollouts / denom,
+            "wrong_stop_frac": wrong_stop_rollouts / denom,
+            "solved_frac": solved_rollouts / denom,
+        }
+    return rate
+
 
 
 if __name__ == "__main__":

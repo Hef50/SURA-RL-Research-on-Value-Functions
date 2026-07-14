@@ -32,7 +32,7 @@ def train_reinforce():
     
 
     ALGORITHM = "REINFORCE"
-    USE_BASELINE = True # Enable baseline critic value function
+    USE_BASELINE = False # Enable baseline critic value function
 
     USE_FIXED_VAL = True
     VAL_SEED = 12345
@@ -41,7 +41,7 @@ def train_reinforce():
     run_name = (
         f"RL_{ALGORITHM}_G{GROUP_SIZE}_{D}x{D} -{val_tag}"
         if ALGORITHM != "REINFORCE"
-        else f"RL_{'REINFORCE_Baseline_CC:' + str(CRITIC_COEFF) if USE_BASELINE else 'Vanilla_REINFORCE'}_{D}x{D}"
+        else f"RL_{'REINFORCE_Baseline_CC:' + str(CRITIC_COEFF) + f"-{val_tag}" if USE_BASELINE else 'Vanilla_REINFORCE'}_{D}x{D} -{val_tag}"
     )
     algo_config = ALGORITHM if ALGORITHM != "REINFORCE" else ("REINFORCE_Baseline" if USE_BASELINE else "Vanilla_REINFORCE")
 
@@ -300,7 +300,13 @@ def train_reinforce():
 
         if global_step % EVAL_INTERVAL == 0:
             print(f"\n--- Running Three-Metric Validation Suite Checkpoint at Step {global_step} ---")
-            val_greedy_rate = evaluate(model, val_env, encode_as_2d_channels, num_mazes=NUM_VAL_MAZES, mode=EvalMode.GREEDY, max_steps=MAX_STEPS, modeltype="CNN", fixed_mazes=fixed_val_mazes)
+            greedy_stats = evaluate(
+                model, val_env, encode_as_2d_channels,
+                num_mazes=NUM_VAL_MAZES, mode=EvalMode.GREEDY,
+                max_steps=MAX_STEPS, modeltype="CNN",
+                fixed_mazes=fixed_val_mazes, return_stats=True,
+            )
+            val_greedy_rate = greedy_stats["rate"]
             
             val_pass_k = evaluate(model, val_env, encode_as_2d_channels, num_mazes=NUM_VAL_MAZES, mode=EvalMode.PASS_K, N=10, max_steps=MAX_STEPS, modeltype="CNN", fixed_mazes=fixed_val_mazes)
             
@@ -310,6 +316,8 @@ def train_reinforce():
 
             wandb.log({
                 "val_greedy_success_rate": val_greedy_rate,
+                "val_greedy_timeout_frac": greedy_stats["timeout_frac"],
+                "val_greedy_wrong_stop_frac": greedy_stats["wrong_stop_frac"],
                 "val_stochastic_pass_10_rate": val_pass_k,
                 "val_stochastic_mean_1_rate": val_mean_1,
                 "global_step": global_step
