@@ -62,3 +62,55 @@ class MazeEnv:
         state = (self.maze, self.agent_pos, self.goal_pos)
         return state, reward, done
 
+
+class VecMazeEnv:
+    # batched maze env -> steps N independent rollouts at once with numpy so the training /
+    # eval loop can do a single big forward pass per timestep instead of N tiny batch-1 calls
+    # move deltas line up with Action indices: UP, DOWN, LEFT, RIGHT (STOP=4 is handled apart)
+    MOVES = np.array([[-1, 0], [1, 0], [0, -1], [0, 1]])
+
+    def __init__(self, mazes, starts, goals, max_steps):
+        self.mazes = np.stack(mazes).astype(np.int8)   # (N, D, D) obstacle grids
+        self.agent = np.array(starts, dtype=np.int64)  # (N, 2) current positions
+        self.goal = np.array(goals, dtype=np.int64)    # (N, 2) goal positions
+        self.N = self.mazes.shape[0]
+        self.D = self.mazes.shape[1]
+        self.max_steps = max_steps
+        self.steps = 0
+        self.done = np.zeros(self.N, dtype=bool) # boolean completion trackers managed per-rollout
+
+    def step(self, actions):
+        # actions: (N,) int array. returns raw reward (N,) float32 and done (N,) bool
+        # same rules as MazeEnv.step, just vectorized across the batch
+        reward = np.zeros(self.N, dtype=np.float32)
+        active = ~self.done # only rollouts that haven't finished get to act this step
+
+        # STOP branch -> reward 1 only if we're standing on the goal, else 0; ends the rollout either way
+        stop = active & (actions == 4)
+        on_goal = np.all(self.agent == self.goal, axis=1)
+        reward[stop & on_goal] = 1.0
+        self.done[stop] = True
+
+        # movement branch -> figure out target cells, only actually move if in-bounds AND not a wall
+        # (same "only move if valid open path" rule as the single-env version)
+        move = active & (actions < 4)
+        target = self.agent + self.MOVES[np.clip(actions, 0, 3)]
+        in_bounds = (
+            (target[:, 0] >= 0) & (target[:, 0] < self.D) &
+            (target[:, 1] >= 0) & (target[:, 1] < self.D)
+        )
+        valid = move & in_bounds
+        # only look up walls for the valid rows so we never index out of range
+        rows = np.where(valid)[0]
+        open_cell = np.zeros(self.N, dtype=bool)
+        open_cell[rows] = self.mazes[rows, target[rows, 0], target[rows, 1]] == 0
+        do_move = valid & open_cell
+        self.agent[do_move] = target[do_move]
+
+        # global step cap -> once we hit it everything is done (same as the single-env version)
+        self.steps += 1
+        if self.steps >= self.max_steps:
+            self.done[:] = True
+
+        return reward, self.done.copy()
+

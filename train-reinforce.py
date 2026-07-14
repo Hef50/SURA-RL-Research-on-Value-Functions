@@ -5,8 +5,8 @@ import torch.optim as optim
 import numpy as np
 import wandb
 
-from environment import MazeEnv
-from maze_encodings import encode_as_2d_channels
+from environment import MazeEnv, VecMazeEnv
+from maze_encodings import encode_as_2d_channels, encode_batch
 from model import MazeCNN
 from evaluate import evaluate, EvalMode
 from maze_generation import build_fixed_eval_set
@@ -14,6 +14,10 @@ from maze_generation import build_fixed_eval_set
 # use CUDA if available
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Using hardware accelerator: {device}")
+
+# input size is fixed every step, so let cudnn autotune the conv algos once and reuse them
+# (harmless on cpu, nice little speedup on the T4)
+torch.backends.cudnn.benchmark = True
 
 def train_reinforce():
     # -- HYPERPARAMETERS --
@@ -31,11 +35,11 @@ def train_reinforce():
     ENTROPY_COEFF = 0.01 # Exploration coefficient (beta) to scale the policy entropy bonus, preventing premature mode collapse
     
 
-    ALGORITHM = "REINFORCE"
+    ALGORITHM = "MaxRL"
     USE_BASELINE = False # Enable baseline critic value function
 
     USE_FIXED_VAL = True
-    VAL_SEED = 12345
+    VAL_SEED = 12347
     NUM_VAL_MAZES = 50
     val_tag = f"valSeed{VAL_SEED}" if USE_FIXED_VAL else "valRandom"
     run_name = (
@@ -98,200 +102,173 @@ def train_reinforce():
 
     for update in range(TOTAL_UPDATES):
         model.train() # set to training mode so parameters track autograd updates
-        optimizer.zero_grad()
+        CURRENT_GROUP_SIZE = GROUP_SIZE if ALGORITHM != "REINFORCE" else 1
+        N = BATCH_SIZE * CURRENT_GROUP_SIZE # total parallel rollouts we run this update
+        # critic head only needed for REINFORCE with baseline for backwards compatibility
+        need_critic = (ALGORITHM == "REINFORCE" and USE_BASELINE)
 
-        # batch accumulators
-        batch_success, batch_reward, batch_lengths, batch_entropy = [], [], [], []
-        batch_c_loss = 0.0
-
-        for b in range(BATCH_SIZE):
+        # sample BATCH_SIZE mazes; for each maze, duplicate the layout GROUP_SIZE times so consecutive
+        # blocks of GROUP_SIZE rollouts share one maze. that shared block is one "group" for RLOO/GRPO/MaxRL.
+        # (caches static maze for group rollouts + stores fixed start/goal coords of agent)
+        mazes, starts, goals = [], [], []
+        for _ in range(BATCH_SIZE):
             env.reset()
-            maze_structure = np.copy(env.maze) # Caches static maze for group rollouts
-            start_pos = tuple(env.agent_pos) # stores fixed start coords of agent
-            goal_pos = tuple(env.goal_pos)
+            for _ in range(CURRENT_GROUP_SIZE):
+                mazes.append(np.copy(env.maze)) # restores/caches frozen maze obstacle layout
+                starts.append(tuple(env.agent_pos)) # stores fixed start coords of agent
+                goals.append(tuple(env.goal_pos))
 
-            group_log_probs = [] # stores lists of step log-probabilities for each group rollout
-            group_rewards = [] # stores the accumulated terminal total reward for each group rollout
-            group_entropies = [] # stores lists of action selection entropies across the group
-            group_state_values = [] # Tracked for REINFORCE with baseline for backwards compatibility
-            group_success = [] # for maxRL tracking
-            group_step_rewards = [] # for per-step negative reward
-            group_lengths = []
-            CURRENT_GROUP_SIZE = GROUP_SIZE if ALGORITHM != "REINFORCE" else 1
+        # one batched env that steps all N rollouts together -> one forward pass per timestep
+        # (teleports every agent back to its start when constructed; steps reset to 0 for max step count)
+        venv = VecMazeEnv(mazes, starts, goals, MAX_STEPS)
 
-            for g in range(CURRENT_GROUP_SIZE):
-                env.maze = np.copy(maze_structure) # Restores frozen maze obstacle
-                env.agent_pos = list(start_pos) # Teleports agent back to start pos
-                env.goal_pos = list(goal_pos)
-                env.steps = 0 # Resets this for max setp count
-                done = False # boolean completion tracker managed by maze environment
-            
-                log_probs, rewards, entropies, state_values = [], [], [], []
-                rollout_success = False # Tracks success of current rollout
-                steps = 0 # track local time steps to give MAX_STEPS cutoff
+        # per-timestep buffers (stacks of step log-probs / entropies / rewards / values across the group)
+        # later stacked into (T, N) once the rollout finishes
+        logp_steps, ent_steps, rew_steps, mask_steps, value_steps = [], [], [], [], []
+        reached = np.zeros(N, dtype=bool) # tracks success of each rollout (STOP on goal -> reward == 1)
 
-                while not done and steps < MAX_STEPS:
-                    # (3, 8, 8) snapshot of current state
-                    state_matrix = encode_as_2d_channels(env.maze, env.agent_pos, env.goal_pos)
+        for t in range(MAX_STEPS):
+            active = ~venv.done # boolean completion tracker: who's still alive at the start of this step
+            if not active.any():
+                break # everyone finished early, no point looping the rest of MAX_STEPS
 
-                    # Cast numpy matrix to float tensor and add a dummy batch dim with unsqueeze -> (1, 3, 8, 8)
-                    # Allocate input tensor array to GPU before running the forward pass
-                    state_tensor = torch.tensor(state_matrix, dtype=torch.float32).unsqueeze(0).to(device)
+            # (N, 3, D, D) snapshot of every current state
+            # np array for C-style contiguous memory allocation, dtype float32 for casting bc that's what model uses
+            states = encode_batch(venv.mazes, venv.agent, venv.goal)
+            # Tensor object cast to track gradients and do fast matrix multiplication; allocate to GPU before the forward pass
+            state_tensor = torch.from_numpy(states).to(device) # encode_batch already hands us float32
 
-                    need_critic = (ALGORITHM == "REINFORCE" and USE_BASELINE)
-                    logits, state_value = model(state_tensor, need_critic=need_critic)
+            # THE win: a single batched forward for all N rollouts instead of N tiny batch-1 ones
+            logits, state_value = model(state_tensor, need_critic=need_critic)
 
+            # create sampling distribution from our logits + sample from it
+            # logits= lets torch do the softmax (same as softmax with dim=-1 since logits is (N, 5))
+            # -> this is why we're using torch distribution btw, so we don't have to write logprob and entropy functions ourselves
+            dist = torch.distributions.Categorical(logits=logits)
+            actions = dist.sample()
 
-                    # softmax with dim -1 to choose the last index since logits is (1, 5) 
-                    probs = F.softmax(logits, dim=-1)
+            # calculate logprob and policy entropy
+            # this logprob = pi_theta(a_t | s_t)
+            logp_steps.append(dist.log_prob(actions)) # (N,), kept on the graph for backprop
+            ent_steps.append(dist.entropy())
+            if need_critic:
+                value_steps.append(state_value.view(-1)) # (N,) critic predictions, one per rollout
 
-                    # create sampling distribution from our probabilities + sample from it
-                    dist = torch.distributions.Categorical(probs)
-                    action = dist.sample()
-                    # calculate logprob and policy entropy
-                    # -> this is why we're using torch distribution btw, so we don't have to write logprob and entropy functions ourselves
-                    # this logprob = pi_theta(a_t | s_t)
-                    log_prob = dist.log_prob(action)
-                    entropy = dist.entropy()
+            # ONE gpu->cpu sync per timestep (not per env) -> then step the numpy env in bulk
+            actions_np = actions.detach().cpu().numpy()
+            reward_raw, done = venv.step(actions_np)
+            # Tracks success of current rollout (env only gives reward==1 on STOP at goal)
+            reached |= (reward_raw == 1.0)
 
-                    _, reward, done = env.step(action.item())
-                    if reward == 1:
-                        rollout_success = True
+            # Append values to trajectory: step penalty on every active, non-success step to discourage wandering
+            # (same rule as before: no penalty once the +1 goal reward fired)
+            penalty = np.where(active & (reward_raw != 1.0), -0.005, 0.0).astype(np.float32)
+            shaped = reward_raw + penalty
 
-                    # Append values to trajectory
-                    step_penalty = 0.0 if rollout_success else -0.005
-                    log_probs.append(log_prob)
-                    rewards.append(reward + step_penalty)
-                    entropies.append(entropy)
-                    if ALGORITHM == "REINFORCE" and USE_BASELINE:
-                        state_values.append(state_value)
+            rew_steps.append(torch.from_numpy(shaped).to(device)) # per-step negative reward shaping
+            mask_steps.append(torch.from_numpy(active.astype(np.float32)).to(device)) # 1 while alive
 
-                    steps += 1
-                
-                group_log_probs.append(log_probs)
-                group_rewards.append(sum(rewards)) 
-                group_entropies.append(entropies)
-                group_state_values.append(state_values)
-                group_success.append(rollout_success)
-                group_step_rewards.append(rewards)
-                group_lengths.append(steps)
-            
-            policy_losses = []
-            value_losses = []
+        # stack the time buffers into (T, N)
+        # Explanation of torch.stack()
+        # CONVENIENCE: torch turns python list into one (T, N) tensor so we can call convenient .sum() functions
+        # IMPORTANCE: creates a master 'StackBackward' intersection node in the computational graph, allowing the trace backward:
+        # loss -> sumbackward from sum -> stackbackward from stack -> mulbackward from log_prob * adv -> categorical from dist
+        # -> dist -> logits -> model -> weights
+        logp = torch.stack(logp_steps) # with grad
+        ent = torch.stack(ent_steps)   # with grad
+        rew = torch.stack(rew_steps)   # shaped rewards, no grad (targets)
+        mask = torch.stack(mask_steps) # 1.0 for steps a rollout was actually active
 
-            if ALGORITHM == "RLOO":
-                R = np.array(group_rewards, dtype=np.float32) # turns into np array for contiguous efficiency
-                group_advantages = np.zeros(CURRENT_GROUP_SIZE, dtype=np.float32)
-                for i in range(CURRENT_GROUP_SIZE):
-                    other_rewards = np.delete(R, i) # creates a copy of R but deletes i -> leaving one out
-                    group_advantages[i] = R[i] - np.mean(other_rewards) # subtracts to use as baseline
-                
-                for i in range(CURRENT_GROUP_SIZE):
-                    # or .mean() for length-normalized
-                    lp_sum = torch.stack(group_log_probs[i]).sum()      
-                    policy_losses.append(-group_advantages[i] * lp_sum)
+        # sum of step log-probabilities for each group rollout / total shaped reward / length
+        sum_logp = (logp * mask).sum(dim=0)    # (N,)
+        total_reward = (rew * mask).sum(dim=0) # (N,) accumulated terminal-ish total reward (sum of shaped steps)
+        lengths = mask.sum(dim=0)              # (N,) response length in steps
 
-                env_loss = torch.stack(policy_losses).sum() / CURRENT_GROUP_SIZE
-            elif ALGORITHM == "GRPO":
-                R = np.array(group_rewards, dtype=np.float32) 
-                group_mean = np.mean(R)
-                group_std = np.std(R) 
-                
-                group_advantages = np.zeros(CURRENT_GROUP_SIZE, dtype=np.float32)
-                for i in range(CURRENT_GROUP_SIZE):
-                    # apply z-score standardization + add a 1e-4 epsilon to prevent dividing by 0
-                    group_advantages[i] = (R[i] - group_mean) / (group_std + 1e-4)
-                
-                for i in range(CURRENT_GROUP_SIZE):
-                    adv = group_advantages[i]
-                    for lp in group_log_probs[i]:
-                        policy_losses.append(-lp * adv)
-                
-                env_loss = torch.stack(policy_losses).sum() / CURRENT_GROUP_SIZE
-            elif ALGORITHM == "MaxRL":
-                successes = np.array(group_success, dtype=np.float32)
-                # count successful rollouts in group
-                K = successes.sum()
-                
-                group_advantages = np.zeros(CURRENT_GROUP_SIZE, dtype=np.float32)
-                for i in range(CURRENT_GROUP_SIZE):
-                    if successes[i] > 0.0 and K > 0.0:
-                        #  successes are scaled down inversely by how common success was in the group
-                        group_advantages[i] = 1.0 / K
-                    else:
-                        # failed traj or batches carry an advantage of 0
-                        group_advantages[i] = 0.0             
-                
-                for i in range(CURRENT_GROUP_SIZE):
-                    adv = group_advantages[i]
-                    for lp in group_log_probs[i]:
-                        policy_losses.append(-lp * adv)
-                
-                env_loss = torch.stack(policy_losses).sum() / CURRENT_GROUP_SIZE
-            elif ALGORITHM == "REINFORCE":
-                rewards = group_rewards[0]   
-                log_probs = group_log_probs[0]   
-                state_values = group_state_values[0]
+        # exploration: mean policy entropy across every action we actually sampled (prevents premature mode collapse)
+        entropy_bonus = (ent * mask).sum() / mask.sum().clamp(min=1.0)
 
-                discounted_returns = []
-                G = 0
-                step_rewards = group_step_rewards[0]
-                # Calculate discounted reward by iterating in reverse
-                for r in reversed(step_rewards):
-                    # Horner's method-style G_t = r_t + gamma * G_{t+1}
-                    G = r + GAMMA * G
-                    # insert at 0 to reverse the reversed list to get discounted returns back in regular order (forward-temporal)
-                    discounted_returns.insert(0, G)
-            
-                discounted_returns = torch.tensor(discounted_returns, dtype=torch.float32).to(device)
-                
-                if USE_BASELINE:
-                    # Concatenate the list of single-item value tensors of dimension (1,1)
-                    # into a continuous 1D tensor vector to align dimensionally with the discounted returns 
-                    state_values = torch.cat(state_values).view(-1)
-                    
-                    # Zip collects together logprob and its corresponding return into tuples
-                    for log_prob, G_t, V_s in zip(log_probs, discounted_returns, state_values):
-                        advantage = G_t - V_s.item()
-                        value_losses.append(F.smooth_l1_loss(V_s, G_t, beta=1.0))
-                        policy_losses.append(-log_prob * advantage)
-                else:
-                    for log_prob, G_t in zip(log_probs, discounted_returns):
-                        policy_losses.append(-log_prob * G_t)
-                
-                # Explanation of torch.stack()
-                # CONVENIENCE: torch turns python list into 1D tensor of size (15) so we can call convenient .sum() function
-                # IMPORTANCE: creates a master 'StackBackward' intersection node in the computational graph, allowing the trace backward:
-                # loss -> sumbackward from sum -> stackbackward from stack -> mulbackward from log_prob * G_t -> categorical from dist
-                # -> dist -> probs -> softmax -> logits -> model -> weights
-                env_loss = torch.stack(policy_losses).sum()
-                if USE_BASELINE:
-                    # Sharing loss backprop for efficiency, learning the same representation of the maze
-                    env_loss += CRITIC_COEFF * torch.stack(value_losses).sum()
-            # 2D list comprehension, e (raw element, no expressions like 2*e) for traj in group entropies + for e in traj
-            flat_entropies = [e for traj in group_entropies for e in traj]
-            env_loss = env_loss - ENTROPY_COEFF * torch.stack(flat_entropies).mean()
+        # reshape rewards to (BATCH_SIZE, GROUP) so each row is one maze's group of rollouts
+        # turns into np array for contiguous efficiency + easy per-group (per-row) math
+        R = total_reward.detach().cpu().numpy().reshape(BATCH_SIZE, CURRENT_GROUP_SIZE)
 
-            # gradient accumulation: /BATCH_SIZE so summed grads = MEAN grad over the batch
-            (env_loss / BATCH_SIZE).backward()
+        value_term = torch.zeros((), device=device) # only REINFORCE with baseline fills this in
 
-            batch_success.append(float(np.mean(group_success)))
-            batch_reward.append(float(np.mean(group_rewards)))
-            batch_lengths.append(float(np.mean(group_lengths)))
-            batch_entropy.append(torch.stack(flat_entropies).mean().item())
-            if ALGORITHM == "REINFORCE" and USE_BASELINE:
-                batch_c_loss += torch.stack(value_losses).sum().item()
+        if ALGORITHM == "RLOO":
+            # leave-one-out: creates (effectively) a copy of each row but deletes i -> leaving one out,
+            # then subtracts the mean of the others to use as baseline
+            loo_mean = (R.sum(axis=1, keepdims=True) - R) / max(CURRENT_GROUP_SIZE - 1, 1)
+            adv = (R - loo_mean).reshape(-1)
+            adv_t = torch.from_numpy(adv.astype(np.float32)).to(device)
+            # sum_logp is the per-rollout sum of log-probs (or .mean() for length-normalized)
+            # since loss = -pi_theta(a_t | s_t) * A_i from the policy gradient theorem
+            policy_loss = -(adv_t * sum_logp).mean()
+        elif ALGORITHM == "GRPO":
+            # apply z-score standardization within each group + add a 1e-4 epsilon to prevent dividing by 0
+            g_mean = R.mean(axis=1, keepdims=True)
+            g_std = R.std(axis=1, keepdims=True)
+            adv = ((R - g_mean) / (g_std + 1e-4)).reshape(-1)
+            adv_t = torch.from_numpy(adv.astype(np.float32)).to(device)
+            policy_loss = -(adv_t * sum_logp).mean()
+        elif ALGORITHM == "MaxRL":
+            # count successful rollouts in each group (K per row) — for MaxRL tracking
+            success_grid = reached.reshape(BATCH_SIZE, CURRENT_GROUP_SIZE).astype(np.float32)
+            K = success_grid.sum(axis=1, keepdims=True)
+            # successes are scaled down inversely by how common success was in the group (1/K);
+            # failed traj or batches carry an advantage of 0
+            adv = np.where((success_grid > 0) & (K > 0), 1.0 / np.maximum(K, 1.0), 0.0).reshape(-1)
+            adv_t = torch.from_numpy(adv.astype(np.float32)).to(device)
+            policy_loss = -(adv_t * sum_logp).mean()
+        elif ALGORITHM == "REINFORCE":
+            # Calculate discounted reward by iterating in reverse, for all N rollouts at once
+            # Horner's method-style G_t = r_t + gamma * G_{t+1}
+            # zero out post-done (masked) rewards first so G doesn't pick up junk if something leaks past done
+            rew_masked = rew * mask
+            returns = torch.zeros_like(rew_masked)
+            G = torch.zeros(N, device=device)
+            for t in range(rew_masked.size(0) - 1, -1, -1):
+                G = rew_masked[t] + GAMMA * G
+                returns[t] = G # builds discounted returns in forward-temporal order as we walk back
 
+            if USE_BASELINE:
+                # Concatenate / stack the list of per-step value tensors into a continuous (T, N)
+                # tensor to align dimensionally with the discounted returns
+                values = torch.stack(value_steps) # (T, N) with grad
+                # Zip-style: each logprob with its corresponding return / value
+                # .detach() so critic error doesn't leak into the policy gradient
+                advantage = returns - values.detach()
+                # huber (smooth L1) value loss — more robust under sparse/spiky returns than plain mse
+                # summed over each rollout's real steps then averaged across rollouts
+                v_loss = F.smooth_l1_loss(values, returns, beta=1.0, reduction="none")
+                value_term = (v_loss * mask).sum(dim=0).mean()
+            else:
+                advantage = returns # vanilla REINFORCE just uses the raw discounted return G_t
+
+            # since loss = -pi_theta(a_t | s_t) * G_t (or A_t) from policy gradient theorem
+            policy_loss = -(logp * advantage * mask).sum(dim=0).mean()
+        else:
+            raise ValueError(f"Unknown ALGORITHM specified: {ALGORITHM}")
+
+        # final loss = policy + (optional critic) - entropy bonus
+        loss = policy_loss - ENTROPY_COEFF * entropy_bonus
+        if need_critic:
+            # Sharing loss backprop for efficiency, learning the same representation of the maze
+            loss = loss + CRITIC_COEFF * value_term
+
+        # whole batch is one graph now, so it's a single backward + step
+        # (replaces the old gradient accumulation: /BATCH_SIZE so summed grads = MEAN grad over the batch)
+        optimizer.zero_grad()
+        loss.backward()
         optimizer.step()
         global_step += 1
 
-        episode_reward = float(np.mean(batch_reward)) # mean reward across batch
-        mean_entropy = float(np.mean(batch_entropy))
-        mean_steps = float(np.mean(batch_lengths))
+        # --- metrics (all detached and cheap) ---
+        episode_reward = total_reward.mean().item() # mean reward across batch
+        mean_entropy = entropy_bonus.item()
+        mean_steps = lengths.mean().item()
+        batch_c_loss = value_term.item() if need_critic else 0.0
 
-
-        # Success requirements
-        is_success = float(np.mean(batch_success))
+        # Success requirements — fraction of rollouts that actually reached the goal
+        is_success = float(reached.mean())
         success_history.append(is_success)
 
         # Create rolling window

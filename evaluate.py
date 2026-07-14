@@ -4,8 +4,8 @@ import random
 import numpy as np
 from enum import Enum
 
-from environment import MazeEnv
-from maze_encodings import encode_as_channels
+from environment import MazeEnv, VecMazeEnv
+from maze_encodings import encode_as_channels, encode_batch
 from model import MazeMLP
 
 class EvalMode(Enum):
@@ -48,116 +48,118 @@ def evaluate_random_policy(num_mazes=100, D=5, max_steps=50):
 def evaluate(model, env, encoding_fn, num_mazes=100, mode=EvalMode.GREEDY,
              N=10, max_steps=50, modeltype="CNN", fixed_mazes=None, return_stats=False):
     # Unified Evaluation Function to evaluate deterministic (Greedy) and stochastic (Pass@k, Mean@k) rollouts cleanly
+    # vectorized: every rollout (across all mazes + attempts) runs as one big parallel batch through a
+    # single forward pass per timestep, instead of one batch-1 forward per step per rollout
     model.eval()
-    
-    # Each pytorch tensor has a .device() method, so we're going to 
+
+    # Each pytorch tensor has a .device() method, so we're going to
     # the first tensor of the model's parameters (NEXT to the model header) to find its device
-    device = next(model.parameters()).device 
+    device = next(model.parameters()).device
 
-    # Tracks complete maze successes for Greedy and Pass@k
-    successful_mazes = 0
-    # Tracks fractional rollout successes for Mean@k
-    maze_success_rates = []
-    timeout_rollouts = 0      # ended by hitting max_steps (loop / never STOP)
-    wrong_stop_rollouts = 0   # issued STOP off-goal
-    solved_rollouts = 0
-    total_rollouts_counted = 0
-
-    # Greedy only requires a single deterministic attempt per maze
+    # Greedy only requires a single deterministic attempt per maze; stochastic modes get N sampled attempts
     rollouts_per_maze = 1 if mode == EvalMode.GREEDY else N
 
     # if fixed: ignore num_mazes, use len(fixed_mazes)
     n = len(fixed_mazes) if fixed_mazes is not None else num_mazes
 
+    # gather the maze set once (either the fixed held-out set or freshly generated ones)
+    base_mazes, base_starts, base_goals = [], [], []
+    for i in range(n):
+        if fixed_mazes is not None:
+            item = fixed_mazes[i]
+            base_mazes.append(np.copy(item["maze"]))
+            # Freezes coordinates into immutable tuples to prevent aliasing bug
+            base_starts.append(tuple(item["start_pos"]))
+            base_goals.append(tuple(item["goal_pos"]))
+        else:
+            env.reset()
+            # If env.maze is ever variable, this freezes maze so successive env.reset()s don't create new mazes
+            base_mazes.append(np.copy(env.maze))
+            base_starts.append(tuple(env.agent_pos))
+            base_goals.append(tuple(env.goal_pos))
+
+    # replicate each maze rollouts_per_maze times so all attempts of all mazes run together as one batch
+    # (same freeze/restore idea as the old per-maze loop, just bulked out beforehand)
+    mazes, starts, goals = [], [], []
+    for i in range(n):
+        for _ in range(rollouts_per_maze):
+            mazes.append(base_mazes[i])
+            starts.append(base_starts[i])
+            goals.append(base_goals[i])
+
+    venv = VecMazeEnv(mazes, starts, goals, max_steps)
+    M = venv.N # total parallel rollouts = n * rollouts_per_maze
+
+    # Tracks: complete solves, wrong STOPs, timeouts (for greedy diagnostics / return_stats)
+    # success = STOP on goal (reward == 1) — same definition as training / MaxRL
+    # wrong_stop = issued STOP off-goal; timeout = ran out the clock without solving
+    reached = np.zeros(M, dtype=bool)
+    wrong_stop = np.zeros(M, dtype=bool)
+
     with torch.no_grad():
-        for i in range(n):
-            if fixed_mazes is not None:
-                item = fixed_mazes[i]
-                maze_structure = np.copy(item["maze"])
-                start_pos = tuple(item["start_pos"])
-                goal_pos = tuple(item["goal_pos"])
+        for _ in range(max_steps):
+            active = ~venv.done # who's still running at the start of this step
+            if not active.any():
+                break # everyone finished, no point looping the rest of max_steps
+
+            # [] for (3D^2) -> batched: encode_batch builds (M, 3, D, D) contiguous float32,
+            # then Tensor cast for fast matrix multiplication / model input
+            states = encode_batch(venv.mazes, venv.agent, venv.goal) # (M, 3, D, D)
+            if modeltype == "MLP":
+                # flatten channels the same way encode_as_channels does (walls | agent | goal)
+                state_tensor = torch.from_numpy(states.reshape(M, -1)).to(device)
+                logits = model(state_tensor)
+            elif modeltype == "CNN":
+                # encoding_fn is the single-maze encoder; we use encode_batch (its vectorized cousin) here
+                # skip critic head — eval only needs the policy logits
+                state_tensor = torch.from_numpy(states).to(device)
+                logits, _ = model(state_tensor, need_critic=False)
             else:
-                env.reset()
-                # If env.maze is ever variable, this freezes maze so successive env.reset()s don't create new mazes
-                maze_structure = np.copy(env.maze)
-                # Freezes coordinates into immutable tuples to prevent aliasing bug
-                start_pos = tuple(env.agent_pos)
-                goal_pos = tuple(env.goal_pos)
+                raise ValueError(f"Unknown MODEL_TYPE specified: {modeltype}")
 
-            maze_solved_any = False
-            successful_attempts = 0
+            if mode == EvalMode.GREEDY:
+                actions = torch.argmax(logits, dim=1) # deterministic argmax, dim=1 selects actions
+            else:
+                # Convert logits to discrete probability distributions, dim=1 to select actions, not batches (dim=0)
+                probs = F.softmax(logits, dim=1)
+                # Randomly sample an index according to probability array distribution
+                actions = torch.multinomial(probs, num_samples=1).squeeze(1)
 
-            for _ in range(rollouts_per_maze):
-                # Reset envr state
-                # If env.maze is ever variable, this brings back starting pos
-                env.maze = np.copy(maze_structure)
-                env.agent_pos = list(start_pos)
-                env.goal_pos = list(goal_pos)
-                env.steps = 0
-                done = False
-                steps = 0
+            # ONE sync per timestep for the whole batch (same win as training)
+            actions_np = actions.detach().cpu().numpy()
 
-                while not done and steps < max_steps:
-                    # [] for (3D^2) -> (1, 3D^2) for batch processing with unsqueeze
-                    # np.array for C-style array contiguous memory allocation
-                    # dtype float32 for casting bc that's what model uses
-                    # Tensor object cast to track gradients and do fast matrix multiplication and input to model 
+            # a STOP (action 4) issued off the goal is a "wrong stop"
+            # classify using pre-step positions so we catch it before the env marks done
+            on_goal = np.all(venv.agent == venv.goal, axis=1)
+            wrong_stop |= active & (actions_np == 4) & (~on_goal)
 
-                    if modeltype == "MLP":
-                        state_vector = encode_as_channels(env.maze, env.agent_pos, env.goal_pos)
-                        state_tensor = torch.tensor(np.array([state_vector]), dtype=torch.float32).to(device)
-                    elif modeltype == "CNN":
-                        state_matrix = encoding_fn(env.maze, env.agent_pos, env.goal_pos)
-                        state_tensor = torch.tensor(state_matrix, dtype=torch.float32).unsqueeze(0).to(device)
-                    else:
-                        raise ValueError(f"Unknown MODEL_TYPE specified: {modeltype}")
-                    
-                    logits, _ = model(state_tensor)
-                    
-                    if mode == EvalMode.GREEDY:
-                        action = torch.argmax(logits, dim=1).item()
-                    else:
-                        # Convert logits to discrete probability distributions, dim=1 to select actions, not batches (dim=0)
-                        probs = F.softmax(logits, dim=1)
-                        
-                        # Randomly sample an index according to probability array distribution
-                        action = torch.multinomial(probs, num_samples=1).item()
-                    
-                    _, _, done = env.step(action)
-                    steps += 1
-                    
-                solved = done and tuple(env.agent_pos) == goal_pos
-                total_rollouts_counted += 1
-                if solved:
-                    solved_rollouts += 1
-                    maze_solved_any = True
-                    successful_attempts += 1
-                    if mode == EvalMode.PASS_K:
-                        break
-                elif steps >= max_steps:
-                    timeout_rollouts += 1      # loop / never emitted STOP
-                else:
-                    wrong_stop_rollouts += 1   # STOPped in the wrong cell
+            reward_raw, _ = venv.step(actions_np)
+            # env only gives reward==1 on STOP at goal — keep this aligned with train_reinforce / MaxRL
+            reached |= (reward_raw == 1.0)
 
-            
-            if mode == EvalMode.MEAN_K:
-                maze_success_rates.append(successful_attempts / rollouts_per_maze)
-            elif maze_solved_any:
-                successful_mazes += 1
-    
-    rate = (np.mean(maze_success_rates) * 100
-        if mode == EvalMode.MEAN_K
-        else (successful_mazes / n) * 100)
+        # reshape per-rollout outcomes to (n, rollouts_per_maze) so we can aggregate per maze
+        solved_grid = reached.reshape(n, rollouts_per_maze)
+
+        if mode == EvalMode.MEAN_K:
+            # fractional rollout success per maze (successful_attempts / rollouts_per_maze), then averaged
+            rate = float(solved_grid.mean(axis=1).mean()) * 100
+        else:
+            # Greedy (1 attempt) and Pass@k both count a maze as solved if ANY attempt reached the goal
+            # (Pass@k no longer early-breaks, but the "at least one success" math is identical —
+            #  we just pay for the unused attempts so the whole batch can stay vectorized)
+            rate = float(solved_grid.any(axis=1).mean()) * 100
+
     if return_stats:
-        denom = max(total_rollouts_counted, 1)
+        denom = max(M, 1)
+        # a rollout that neither solved nor wrong-stopped simply ran out the clock -> timeout / never emitted STOP
+        timeout = ~reached & ~wrong_stop
         return {
             "rate": rate,
-            "timeout_frac": timeout_rollouts / denom,
-            "wrong_stop_frac": wrong_stop_rollouts / denom,
-            "solved_frac": solved_rollouts / denom,
+            "timeout_frac": float(timeout.sum()) / denom,     # loop / never emitted STOP
+            "wrong_stop_frac": float(wrong_stop.sum()) / denom,
+            "solved_frac": float(reached.sum()) / denom,
         }
     return rate
-
 
 
 if __name__ == "__main__":
