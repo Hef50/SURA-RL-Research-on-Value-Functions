@@ -53,7 +53,7 @@ class MazeCNN(nn.Module):
         # Final linear layer to collapse the critic's hidden features into a single continuous scalar state-value prediction
         self.value_head = nn.Linear(hidden_dim, 1) 
 
-    def forward(self, x):
+    def forward(self, x, need_critic=True):
         out = self.relu1(self.conv1(x))
         out = self.relu2(self.conv2(out))
 
@@ -65,6 +65,9 @@ class MazeCNN(nn.Module):
         # MLP classification for Actor
         actor_out = self.relu3(self.fc1(out))
         logits = self.fc2(actor_out)
+        
+        if not need_critic:
+            return logits, None
 
         # Critic evaluation
         critic_out = F.relu(self.fc_critic(out))

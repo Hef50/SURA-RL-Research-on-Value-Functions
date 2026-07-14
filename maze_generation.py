@@ -103,6 +103,28 @@ def generate_mazes(n, D):
         })
     return dataset
 
+def build_fixed_eval_set(D, num_mazes=50, seed=12345):
+    # Deterministic held-out mazes. Same seed => same set on every machine/run.
+    rng = np.random.RandomState(seed)
+    py_state = random.getstate()
+    np_state = np.random.get_state()
+    mazes = []
+    for i in range(num_mazes):
+        # isolate per-maze randomness from training RNG
+        maze_seed = int(rng.randint(0, 2**31 - 1))
+        random.seed(maze_seed)
+        np.random.seed(maze_seed)
+        maze = generate_maze(D, seed=maze_seed)
+        start, goal = place_start_goal(maze)
+        mazes.append({
+            "maze": maze.copy(),
+            "start_pos": tuple(start),
+            "goal_pos": tuple(goal),
+        })
+    random.setstate(py_state)
+    np.random.set_state(np_state)
+    return mazes
+
 if __name__ == "__main__":
     D = 21
     print(f"Generating a {D}x{D} maze: ")

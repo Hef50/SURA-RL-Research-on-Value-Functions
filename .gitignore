@@ -2,3 +2,4 @@
 wandb
 .putra
 .env.local
+__pycache__
