@@ -1,4 +1,5 @@
-﻿import torch
+﻿import os
+import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
@@ -18,6 +19,13 @@ print(f"Using hardware accelerator: {device}")
 # input size is fixed every step, so let cudnn autotune the conv algos once and reuse them
 # (harmless on cpu, nice little speedup on the T4)
 torch.backends.cudnn.benchmark = True
+
+def resolve_path(filename):
+    # prefer checkpoints/<name>, fall back to cwd (handy for flat Colab uploads)
+    ckpt_path = os.path.join("checkpoints", filename)
+    if os.path.exists(ckpt_path):
+        return ckpt_path
+    return filename
 
 def train_reinforce():
     # -- HYPERPARAMETERS --
@@ -87,10 +95,11 @@ def train_reinforce():
     # Load model to graphics card memory (VRAM)
     model = MazeCNN(d=D, hidden_dim=128).to(device)
 
-    # Loads model to VRAM
+    # Loads model to VRAM (checkpoints/BFS_BC_CNN-RL-starter.pth, or same folder on Colab)
     # Strict=false acknowledges that starter doesn't have values for fc_critic, etc. but that's okay
-    model.load_state_dict(torch.load("BFS_BC_CNN-RL-starter.pth", map_location=device), strict=False) 
-    print("Loaded warm-start maze_CNN baseline.")
+    starter_path = resolve_path("BFS_BC_CNN-RL-starter.pth")
+    model.load_state_dict(torch.load(starter_path, map_location=device), strict=False)
+    print(f"Loaded warm-start maze_CNN baseline from {starter_path}.")
 
     optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE)
     global_step = 0
@@ -163,6 +172,8 @@ def train_reinforce():
             # Append values to trajectory: step penalty on every active, non-success step to discourage wandering
             # (same rule as before: no penalty once the +1 goal reward fired)
             penalty = np.where(active & (reward_raw != 1.0), -0.005, 0.0).astype(np.float32)
+            wrong_stop = active & (actions_np == 4) & (reward_raw == 0.0)
+            penalty = np.where(wrong_stop, -0.5, penalty)
             shaped = reward_raw + penalty
 
             rew_steps.append(torch.from_numpy(shaped).to(device)) # per-step negative reward shaping
@@ -315,8 +326,12 @@ def train_reinforce():
                 "global_step": global_step
             })
     
-    torch.save(model.state_dict(),f"maze_{ALGORITHM}.pth")
-    print(f"{ALGORITHM} training complete. Weights saved successfully!")
+    # save into checkpoints/ when that folder exists (local repo); otherwise cwd (Colab)
+    out_name = f"maze_{ALGORITHM}.pth"
+    out_dir = "checkpoints" if os.path.isdir("checkpoints") else "."
+    out_path = os.path.join(out_dir, out_name)
+    torch.save(model.state_dict(), out_path)
+    print(f"{ALGORITHM} training complete. Weights saved to {out_path}!")
 
     wandb.finish()
 

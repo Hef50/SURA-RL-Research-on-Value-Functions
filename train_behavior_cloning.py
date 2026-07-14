@@ -218,8 +218,12 @@ def train_behavioral_cloning():
             "global_step": global_step
         })
     
-    torch.save(model.state_dict(), f"maze_{MODEL_TYPE}.pth")
-    print(f"Model weights successfully saved to maze_{MODEL_TYPE}.pth!")
+    import os
+    out_name = f"maze_{MODEL_TYPE}.pth"
+    out_dir = "checkpoints" if os.path.isdir("checkpoints") else "."
+    out_path = os.path.join(out_dir, out_name)
+    torch.save(model.state_dict(), out_path)
+    print(f"Model weights successfully saved to {out_path}!")
 
     wandb.finish()
 

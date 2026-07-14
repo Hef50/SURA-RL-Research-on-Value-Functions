@@ -49,59 +49,58 @@ The project uses **procedurally generated maze environments** as a cheap, contro
 
 ```
 .
-├── maze_generation.py     # randomized Prim's maze generator + start/goal placement
-├── environment.py         # the terminal-reward maze simulator (reset / step)
-├── bfs_expert.py          # BFS shortest-path expert for behavior cloning
-├── encodings.py           # maze-state -> vector encodings (compared experimentally)
-├── model.py               # policy networks (MLP / CNN) and value head
-├── train_bc.py            # behavior-cloning (supervised) training
-├── algorithms/            # RL algorithms
-│   ├── reinforce.py
-│   ├── reinforce_baseline.py
-│   ├── rloo.py
-│   ├── grpo.py
-│   └── maxrl.py
-├── evaluate.py            # rollouts + metrics (greedy / stochastic success rates)
-├── visualize.py           # renders mazes and policy behavior over training
+├── train-reinforce.py          # unified RL training (REINFORCE / RLOO / GRPO / MaxRL)
+├── train_behavior_cloning.py   # BC warm-start training (needs bfs_expert.py)
+├── bfs_expert.py               # BFS expert for BC
+├── environment.py              # MazeEnv + VecMazeEnv (batched rollouts)
+├── maze_generation.py          # Prim mazes + build_fixed_eval_set
+├── maze_encodings.py           # single-maze + batched encodings
+├── model.py                    # MazeCNN / MazeMLP (+ critic head)
+├── evaluate.py                 # greedy / pass@k / mean@k (+ timeout stats)
+├── checkpoints/                # .pth weights (starter + trained)
+├── assets/                     # figures / trajectory plots
+├── archive/                    # older one-off scripts (not needed for training)
+├── COLAB.md                    # what to upload to Colab
 └── README.md
 ```
-*(Adjust to match your actual file layout.)*
 
 ---
 
 ## Setup
 
 ```bash
-git clone https://github.com/<your-username>/<repo-name>.git
-cd <repo-name>
+git clone <your-repo-url>
+cd SURA
 
-python -m venv venv
-source venv/bin/activate        # Windows: venv\Scripts\activate
+python -m venv .venv
+# Windows:
+.venv\Scripts\activate
+# macOS/Linux:
+# source .venv/bin/activate
 
 pip install numpy torch matplotlib wandb
-wandb login                     # authenticate for experiment tracking
+wandb login
 ```
 
-For larger-scale runs, training can be moved to a Colab GPU runtime (clone the repo into Colab and set the runtime to GPU).
+### Colab
+
+See **[COLAB.md](COLAB.md)** for the exact upload list. Short version: upload the 6 training modules + `BFS_BC_CNN-RL-starter.pth` (from `checkpoints/` or flattened into one folder), enable a T4 GPU, `pip install wandb`, then run `train-reinforce.py`.
 
 ---
 
 ## Usage
 
 ```bash
-# 1. Train a behavior-cloning baseline / warm-start checkpoint
-python train_bc.py --grid_size 8 --epochs 1 --out model.pth
+# 1. (Optional) Train a BC warm-start — writes checkpoints/maze_CNN.pth
+python train_behavior_cloning.py
+# rename/copy to checkpoints/BFS_BC_CNN-RL-starter.pth if you're producing a new starter
 
-# 2. Train an RL method, warm-started from the BC checkpoint
-python -m algorithms.reinforce --init model.pth --grid_size 8
+# 2. Train RL (set ALGORITHM inside train-reinforce.py)
+python train-reinforce.py
 
-# 3. Evaluate a trained policy
-python evaluate.py --checkpoint <path> --num_mazes 500 --stochastic
-
-# 4. Visualize policy behavior
-python visualize.py --checkpoint <path>
+# 3. Smoke-test evaluation helpers
+python evaluate.py
 ```
-*(Example commands — update flags to match your implementation.)*
 
 ---
 

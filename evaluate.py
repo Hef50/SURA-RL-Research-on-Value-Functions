@@ -179,8 +179,10 @@ if __name__ == "__main__":
     
     model = MazeMLP(input_dim=len(sample_state), hidden_dim=HIDDEN_DIM, num_layers=3)
     try:
-        model.load_state_dict(torch.load("maze_mlp.pth"))
-        print("Loaded weights from maze_mlp.pth successfully.")
+        import os
+        mlp_path = os.path.join("checkpoints", "maze_mlp.pth") if os.path.exists(os.path.join("checkpoints", "maze_mlp.pth")) else "maze_mlp.pth"
+        model.load_state_dict(torch.load(mlp_path))
+        print(f"Loaded weights from {mlp_path} successfully.")
         
         # greedy_rate = evaluate_model_policy_greedy(model, env, encode_as_channels, num_mazes=100, max_steps=MAX_STEPS)
         # stoch_rate = evaluate_stochastic_pass_k(model, env, encode_as_channels, num_mazes=100, N=10, max_steps=MAX_STEPS)
@@ -188,4 +190,4 @@ if __name__ == "__main__":
         # print(f"Greedy Policy Success Rate: {greedy_rate:.1f}%")
         # print(f"Stochastic Pass@10 Success Rate: {stoch_rate:.1f}%")
     except FileNotFoundError:
-        print("Could not find weights file. Run train.py first to create maze_mlp.pth.")
+        print("Could not find weights file. Run train_behavior_cloning.py first to create maze_mlp.pth.")
