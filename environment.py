@@ -83,9 +83,11 @@ class VecMazeEnv:
         # actions: (N,) int array. returns raw reward (N,) float32 and done (N,) bool
         # same rules as MazeEnv.step, just vectorized across the batch
         reward = np.zeros(self.N, dtype=np.float32)
+        # ~ = element-wise NOT
         active = ~self.done # only rollouts that haven't finished get to act this step
 
         # STOP branch -> reward 1 only if we're standing on the goal, else 0; ends the rollout either way
+        # & = element-wise and
         stop = active & (actions == 4)
         on_goal = np.all(self.agent == self.goal, axis=1)
         reward[stop & on_goal] = 1.0
@@ -94,10 +96,13 @@ class VecMazeEnv:
         # movement branch -> figure out target cells, only actually move if in-bounds AND not a wall
         # (same "only move if valid open path" rule as the single-env version)
         move = active & (actions < 4)
+        # np.clip so actions is never 4 as MOVES only goes up to 3
         target = self.agent + self.MOVES[np.clip(actions, 0, 3)]
         in_bounds = (
+            # target[:, 0] = every row (all envs), but only col 0 (all row coords)
             (target[:, 0] >= 0) & (target[:, 0] < self.D) &
             (target[:, 1] >= 0) & (target[:, 1] < self.D)
+            # target[:, 1] = every row (all envs), but only col 1 (all col coords)
         )
         valid = move & in_bounds
         # only look up walls for the valid rows so we never index out of range
