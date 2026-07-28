@@ -9,13 +9,13 @@ A research project investigating **whether learned value functions provide meani
 
 ## Overview
 
-Modern reinforcement learning for reasoning LLMs is dominated by **terminal-reward** methods: a model generates a full response and receives a single scalar reward at the end (e.g., 1 if the answer is correct, 0 otherwise). Increasingly, the field has moved toward **critic-free, group-based** optimization methods — GRPO, RLOO, and MaxRL — that estimate a baseline from a *group* of sampled rollouts rather than from a learned value function.
+Modern reinforcement learning for reasoning LLMs is dominated by **terminal-reward** methods: a model generates a full response and receives a single scalar reward at the end (e.g., 1 if the answer is correct, 0 otherwise). Increasingly, the field has moved toward **critic-free, group-based** optimization methods (GRPO, RLOO, and MaxRL) that estimate a baseline from a *group* of sampled rollouts rather than from a learned value function.
 
 Value functions are a classical tool for reducing variance and improving credit assignment in RL, and they are well-established in dense-reward settings. Yet their utility in the terminal-reward regime remains **an open and actively debated question**: the field largely moved away from critics without a clean, controlled study of whether they help here.
 
 This project builds a low-compute maze testbed to study that question directly, and to explore a specific hypothesis:
 
-> **Group-based methods like MaxRL currently require multiple rollouts per prompt (a "group") to estimate their learning signal, which is computationally expensive. A learned value function could, in principle, provide that signal from a single rollout — potentially making MaxRL-style training substantially cheaper.**
+> **Group-based methods like MaxRL currently require multiple rollouts per prompt (a "group") to estimate their learning signal, which is computationally expensive. A learned value function could, in principle, provide that signal from a single rollout, potentially making MaxRL-style training substantially cheaper.**
 
 ---
 
@@ -34,12 +34,12 @@ The project uses **procedurally generated maze environments** as a cheap, contro
 **Environment.** An agent navigates a randomly generated `D×D` maze (built with randomized Prim's algorithm) toward a goal, choosing from five actions `{up, down, left, right, stop}`. The reward is strictly terminal and binary: **+1 only if the agent issues `stop` while on the goal cell, and 0 otherwise** (including a premature `stop`, which ends the episode). Start and goal positions are randomized per maze; maze size is a tunable parameter.
 
 **Methods implemented / under comparison:**
-- **Behavior Cloning (BC)** — a supervised baseline that imitates a BFS shortest-path expert; also used to warm-start RL.
+- **Behavior Cloning (BC)**: a supervised baseline that imitates a BFS shortest-path expert; also used to warm-start RL.
 - **REINFORCE** — vanilla policy gradient.
-- **REINFORCE with a value-function baseline** — the classical variance-reduction approach.
-- **RLOO** (REINFORCE Leave-One-Out) — group baseline from the other samples.
-- **GRPO** (Group Relative Policy Optimization) — group-normalized advantages.
-- **MaxRL** — a maximum-likelihood, success-normalized group method.
+- **REINFORCE with a value-function baseline**: the classical variance-reduction approach.
+- **RLOO** (REINFORCE Leave-One-Out): group baseline from the other samples.
+- **GRPO** (Group Relative Policy Optimization): group-normalized advantages.
+- **MaxRL**: a maximum-likelihood, success-normalized group method.
 
 **Evaluation.** Policies are compared on maze success rate (both greedy and stochastic pass@k-style rollouts), sample efficiency, training stability, gradient variance, policy entropy, mean reward, and response length. All experiments are tracked with [Weights & Biases](https://wandb.ai/).
 
@@ -60,7 +60,6 @@ The project uses **procedurally generated maze environments** as a cheap, contro
 ├── checkpoints/                # .pth weights (starter + trained)
 ├── assets/                     # figures / trajectory plots
 ├── archive/                    # older one-off scripts (not needed for training)
-├── COLAB.md                    # what to upload to Colab
 └── README.md
 ```
 
@@ -81,10 +80,6 @@ python -m venv .venv
 pip install numpy torch matplotlib wandb
 wandb login
 ```
-
-### Colab
-
-See **[COLAB.md](COLAB.md)** for the exact upload list. Short version: upload the 6 training modules + `BFS_BC_CNN-RL-starter.pth` (from `checkpoints/` or flattened into one folder), enable a T4 GPU, `pip install wandb`, then run `train-reinforce.py`.
 
 ---
 
@@ -108,14 +103,9 @@ python evaluate.py
 
 Key methods and references informing this work:
 
-- Williams (1992), *Simple statistical gradient-following algorithms for connectionist reinforcement learning* — REINFORCE.
-- Sutton & Barto, *Reinforcement Learning: An Introduction* (2nd ed.) — policy gradients, baselines, actor-critic (Ch. 13).
-- Schulman et al. (2015), *High-Dimensional Continuous Control Using Generalized Advantage Estimation* — GAE.
-- Shao et al. (2024), *DeepSeekMath* — GRPO (critic-free, group-normalized).
-- Ahmadian et al. (2024), *Back to Basics: Revisiting REINFORCE-style Optimization for LLMs* — RLOO.
+- Williams (1992), *Simple statistical gradient-following algorithms for connectionist reinforcement learning*: REINFORCE algorithm.
+- Sutton & Barto, *Reinforcement Learning: An Introduction* (2nd ed.): policy gradients, baselines, actor-critic (Ch. 13).
 - Tajwar, Arora, …, Zanette (2026), *MaxRL* — maximum-likelihood RL for verifiable-correctness tasks.
-
-*(Add exact links/citations as appropriate.)*
 
 ---
 
