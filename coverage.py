@@ -60,53 +60,59 @@ if __name__ == "__main__":
     TEST_SEED = 999
     NUM_TEST_MAZES = 200
 
-    K_VALUES = [1, 10, 32, 64, 128]
+    K_VALUES = [1, 2, 4, 8, 16, 32, 64, 128]
     N_SAMPLES = 256  # >= 2 * max(K_VALUES) so pass@128 averages over many subsets, not one draw
     CHUNK = 32
 
-    # label -> checkpoint filename. "Base" is the BC warm-start, i.e. the model RL started from
-    CHECKPOINTS = {
-        "Base (BC)": "BFS_BC_CNN-RL-starter.pth",
-        "MaxRL": "maze_MaxRL_G8_8x8_s0.pth",
-        "GRPO": "maze_GRPO_G8_8x8_s0.pth",
-        "RLOO": "maze_RLOO_G8_8x8_s0.pth",
-        "Vanilla REINFORCE": "maze_Vanilla_REINFORCE_G1_8x8_s0.pth",
-        "REINFORCE + baseline": "maze_REINFORCE_Baseline_G1_8x8_s0.pth"
-    }
-
+    # label -> checkpoint filename, built from the sweep manifest so nothing is hand-typed
+    SWEEP = "valuefn_v1"
+    with open(resolve_path(f"runs_{SWEEP}.json")) as f:
+        runs = [r for r in json.load(f) if r["SEED"] == 0]
+    def label_of(r):
+        name = r["ALGORITHM"] + (" + V" if r.get("USE_CRITIC") else "")
+        name += f" (G={r.get('GROUP_SIZE', 8)})"
+        return name + (f" [{r['TAG']}]" if r.get("TAG") else "")
+    CHECKPOINTS = {"Base (BC)": "BFS_BC_CNN-RL-starter.pth"}
+    for r in runs:
+        CHECKPOINTS[label_of(r)] = os.path.basename(r["checkpoint"])
     test_mazes = build_fixed_eval_set(D=D, num_mazes=NUM_TEST_MAZES, seed=TEST_SEED)
     print(f"Coverage sweep: {NUM_TEST_MAZES} held-out {D}x{D} mazes, n={N_SAMPLES} samples each")
-
-    curves = {}
+    # sample ONCE per checkpoint and keep the raw per-maze counts. every k value, every re-plot
+    # and the calibration figure all come out of these without touching the GPU again
+    all_counts = {}
     for label, filename in CHECKPOINTS.items():
         path = resolve_path(filename)
         if not os.path.exists(path):
             print(f"skipping {label}: {path} not found")
             continue
-
         model = MazeCNN(d=D, hidden_dim=HIDDEN_DIM).to(device)
-        # strict=False: the BC starter has no critic-head weights
         model.load_state_dict(torch.load(path, map_location=device), strict=False)
         print(f"{label} <- {path}")
-
         counts, n = success_counts(model, test_mazes, D, MAX_STEPS, N_SAMPLES, CHUNK)
-        curves[label] = [100.0 * float(np.mean([pass_at_k(n, c, k) for c in counts])) for k in K_VALUES]
-        print("  " + " | ".join(f"pass@{k}: {v:.1f}%" for k, v in zip(K_VALUES, curves[label])))
-
+        all_counts[label] = counts.tolist()
+    curves = {lbl: [100.0 * float(np.mean([pass_at_k(N_SAMPLES, c, k) for c in cts])) for k in K_VALUES]
+            for lbl, cts in all_counts.items()}
+    for lbl, ys in curves.items():
+        print(f"{lbl:32s} " + " | ".join(f"@{k}: {v:.1f}" for k, v in zip(K_VALUES, ys)))
     os.makedirs("assets", exist_ok=True)
-    with open(os.path.join("assets", "coverage_pass_at_k.json"), "w") as f:
-        json.dump({"k_values": K_VALUES, "n_samples": N_SAMPLES, "curves": curves}, f, indent=2)
-
-    plt.figure(figsize=(5.5, 4.5))
-    for label, ys in curves.items():
-        plt.plot(K_VALUES, ys, marker="^", linewidth=2, markersize=6, label=label)
-    plt.xscale("log", base=2)  # the paper's x-axis is log2 k; a crossover is only visible this way
-    plt.xticks(K_VALUES, [str(k) for k in K_VALUES])
-    plt.xlabel("Number of samples $k$")
-    plt.ylabel("Coverage (pass@$k$) %")
-    plt.title(f"{D}x{D} mazes, {NUM_TEST_MAZES} held-out, n={N_SAMPLES}")
-    plt.ylim(0, 100)
-    plt.grid(alpha=0.3)
-    plt.legend()
-    plt.savefig(os.path.join("assets", "coverage_pass_at_k.png"), dpi=200, bbox_inches="tight")
-    print("Saved assets/coverage_pass_at_k.png")
+    with open(os.path.join("assets", f"coverage_{SWEEP}.json"), "w") as f:
+        json.dump({"k_values": K_VALUES, "n_samples": N_SAMPLES,
+                "counts": all_counts, "curves": curves}, f, indent=2)
+    # one figure per algorithm — twelve curves on a single axis is unreadable
+    for algo in ["MaxRL", "GRPO", "RLOO"]:
+        subset = {l: v for l, v in curves.items() if l.startswith(algo) or l.startswith("Base")}
+        if len(subset) <= 1:
+            continue
+        plt.figure(figsize=(5.5, 4.5))
+        for label, ys in subset.items():
+            plt.plot(K_VALUES, ys, marker="^", linewidth=2, markersize=6, label=label)
+        plt.xscale("log", base=2)
+        plt.xticks(K_VALUES, [str(k) for k in K_VALUES])
+        plt.xlabel("Number of samples $k$")
+        plt.ylabel("Coverage (pass@$k$) %")
+        plt.title(f"{algo}: {D}x{D}, {NUM_TEST_MAZES} held-out, n={N_SAMPLES}")
+        plt.ylim(0, 100)
+        plt.grid(alpha=0.3)
+        plt.legend(fontsize=8)
+        plt.savefig(os.path.join("assets", f"coverage_{algo}.png"), dpi=200, bbox_inches="tight")
+        print(f"Saved assets/coverage_{algo}.png")
