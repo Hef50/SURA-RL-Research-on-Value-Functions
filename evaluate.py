@@ -46,7 +46,7 @@ def evaluate_random_policy(num_mazes=100, D=5, max_steps=50):
     return success_rate
 
 def evaluate(model, env, encoding_fn, num_mazes=100, mode=EvalMode.GREEDY,
-             N=10, max_steps=50, modeltype="CNN", fixed_mazes=None, return_stats=False):
+             N=10, max_steps=50, modeltype="CNN", fixed_mazes=None, return_stats=False, return_grid=False):
     # Unified Evaluation Function to evaluate deterministic (Greedy) and stochastic (Pass@k, Mean@k) rollouts cleanly
     # vectorized: every rollout (across all mazes + attempts) runs as one big parallel batch through a
     # single forward pass per timestep, instead of one batch-1 forward per step per rollout
@@ -148,6 +148,10 @@ def evaluate(model, env, encoding_fn, num_mazes=100, mode=EvalMode.GREEDY,
             # (Pass@k no longer early-breaks, but the "at least one success" math is identical —
             #  we just pay for the unused attempts so the whole batch can stay vectorized)
             rate = float(solved_grid.any(axis=1).mean()) * 100
+
+    if return_grid:
+        # saves compute for subset probability formula 
+        return solved_grid
 
     if return_stats:
         denom = max(M, 1)

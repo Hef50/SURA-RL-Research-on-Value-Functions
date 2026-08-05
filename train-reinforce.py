@@ -1,4 +1,6 @@
 ﻿import os
+import json
+import random
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -27,48 +29,71 @@ def resolve_path(filename):
         return ckpt_path
     return filename
 
-def train_reinforce():
-    # -- HYPERPARAMETERS --
-    D = 8 # size of maze
-    GAMMA = 0.99 # discount factor for future rewards
-    LEARNING_RATE = 5e-5 # Lower LR for RL for policy gradient stability
-    TOTAL_UPDATES = 200 # How many gradient steps (how many times optimizer.step() called)
-    BATCH_SIZE = 32 # Mazes (independent environments) per update
-    GROUP_SIZE = 8 # Rollouts per maze (1 for REINFORCE, __ for group methods)
+def set_seed(seed):
+    # maze layouts come from np.random (generate_maze) and start/goal from random.sample
+    # (place_start_goal), so a reproducible run has to pin both plus torch's sampling RNG
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
 
-    MAX_STEPS = 60
-    LOG_INTERVAL = 10 # Log interval to W&B -> every __ updates
-    EVAL_INTERVAL = 20 # Evaluate on held-out test mazes every __ updates
-    CRITIC_COEFF = 0.1 # downscaling critic's dominance to protect policy learning if needed
-    ENTROPY_COEFF = 0.01 # Exploration coefficient (beta) to scale the policy entropy bonus, preventing premature mode collapse
-    
 
-    ALGORITHM = "MaxRL"
-    USE_BASELINE = False # Enable baseline critic value function
+def train_reinforce(
+    # -- HYPERPARAMETERS (defaults; a sweep entry overrides any subset of these by name) --
+    ALGORITHM="MaxRL",
+    USE_BASELINE=False, # Enable baseline critic value function
+    D=8, # size of maze
+    GAMMA=0.99, # discount factor for future rewards
+    LEARNING_RATE=5e-5, # Lower LR for RL for policy gradient stability
+    TOTAL_UPDATES=200, # How many gradient steps (how many times optimizer.step() called)
+    BATCH_SIZE=32, # Mazes (independent environments) per update
+    GROUP_SIZE=8, # Rollouts per maze (1 for REINFORCE, __ for group methods)
+    MAX_STEPS=60,
+    LOG_INTERVAL=10, # Log interval to W&B -> every __ updates
+    EVAL_INTERVAL=20, # Evaluate on held-out test mazes every __ updates
+    CRITIC_COEFF=0.1, # downscaling critic's dominance to protect policy learning if needed
+    ENTROPY_COEFF=0.01, # Exploration coefficient (beta) to scale the policy entropy bonus, preventing premature mode collapse
+    USE_FIXED_VAL=True,
+    VAL_SEED=12350,
+    NUM_VAL_MAZES=50,
+    SEED=0, # train-side RNG seed -> same config, different seed = a repeat, not a duplicate
+    TAG="", # free-form suffix so one-off sweep variants are findable in W&B
+    WANDB_GROUP=None, # collapses every run of a sweep into one group in the W&B UI
+):
+    set_seed(SEED)
 
-    USE_FIXED_VAL = True
-    VAL_SEED = 12347
-    NUM_VAL_MAZES = 50
-    val_tag = f"valSeed{VAL_SEED}" if USE_FIXED_VAL else "valRandom"
-    run_name = (
-        f"RL_{ALGORITHM}_G{GROUP_SIZE}_{D}x{D} -{val_tag}"
-        if ALGORITHM != "REINFORCE"
-        else f"RL_{'REINFORCE_Baseline_CC:' + str(CRITIC_COEFF) + f"-{val_tag}" if USE_BASELINE else 'Vanilla_REINFORCE'}_{D}x{D} -{val_tag}"
-    )
     algo_config = ALGORITHM if ALGORITHM != "REINFORCE" else ("REINFORCE_Baseline" if USE_BASELINE else "Vanilla_REINFORCE")
+    CURRENT_GROUP = GROUP_SIZE if ALGORITHM != "REINFORCE" else 1
+    val_tag = f"valSeed{VAL_SEED}" if USE_FIXED_VAL else "valRandom"
+
+    # one flat name builder for every algorithm: whatever can differ between two sweep runs
+    # (algorithm, group size, lr, seed) has to be in the name, or W&B and the .pth files collide
+    run_name = f"RL_{algo_config}_G{CURRENT_GROUP}_{D}x{D}_lr{LEARNING_RATE:g}_s{SEED}-{val_tag}"
+    if USE_BASELINE and ALGORITHM == "REINFORCE":
+        run_name += f"_CC{CRITIC_COEFF}"
+    if TAG:
+        run_name += f"-{TAG}"
+
+    # checkpoint filename mirrors the run name for the same reason: the old fixed
+    # maze_{ALGORITHM}.pth meant run 2 silently overwrote run 1's weights
+    out_name = f"maze_{algo_config}_G{CURRENT_GROUP}_{D}x{D}_s{SEED}" + (f"_{TAG}" if TAG else "") + ".pth"
 
     # Dependent Reference Counts
-    TOTAL_ENVS = TOTAL_UPDATES * BATCH_SIZE # Num mazes 
-    CURRENT_GROUP = GROUP_SIZE if ALGORITHM != "REINFORCE" else 1
+    TOTAL_ENVS = TOTAL_UPDATES * BATCH_SIZE # Num mazes
     TOTAL_ROLLOUTS = TOTAL_ENVS * CURRENT_GROUP
 
     wandb.init(
         project="SURA",
         name=run_name,
+        group=WANDB_GROUP, # every run in a sweep shares this -> W&B can average/compare them
+        reinit=True, # a sweep calls init() many times in one process
         config={
+            "seed": SEED,
+            "batch_size": BATCH_SIZE,
+            "total_updates": TOTAL_UPDATES,
             "grid_size": D,
             "algorithm": algo_config,
-            "group_size": GROUP_SIZE if ALGORITHM != "REINFORCE" else 1,
+            "group_size": CURRENT_GROUP,
             "gamma": GAMMA,
             "lr": LEARNING_RATE,
             "max_steps": MAX_STEPS,
@@ -327,14 +352,46 @@ def train_reinforce():
             })
     
     # save into checkpoints/ when that folder exists (local repo); otherwise cwd (Colab)
-    out_name = f"maze_{ALGORITHM}.pth"
+    # (out_name was built alongside run_name so the two always agree)
     out_dir = "checkpoints" if os.path.isdir("checkpoints") else "."
     out_path = os.path.join(out_dir, out_name)
     torch.save(model.state_dict(), out_path)
-    print(f"{ALGORITHM} training complete. Weights saved to {out_path}!")
+    print(f"{run_name} complete. Weights saved to {out_path}!")
 
     wandb.finish()
+    # handed back so the sweep driver can record which checkpoint belongs to which config
+    return run_name, out_path
 
 if __name__ == "__main__":
-    train_reinforce()        
+    SWEEP = "coverage_v1"
+    SEEDS = [0, 1, 2]
+    RUNS = [
+        {"ALGORITHM": "REINFORCE", "USE_BASELINE": False},
+        {"ALGORITHM": "REINFORCE", "USE_BASELINE": True},
+        {"ALGORITHM": "RLOO",  "GROUP_SIZE": 8},
+        {"ALGORITHM": "GRPO",  "GROUP_SIZE": 8},
+        {"ALGORITHM": "MaxRL", "GROUP_SIZE": 8},
+    ]
+
+    out_dir = "checkpoints" if os.path.isdir("checkpoints") else "."
+    manifest_path = os.path.join(out_dir, f"runs_{SWEEP}.json")
+    manifest = []
+
+    for seed in SEEDS:
+        for run in RUNS:
+            cfg = {"WANDB_GROUP": SWEEP, "SEED": seed, **run}
+            print(f"\n===== sweep {SWEEP} | run {len(manifest) + 1} | {cfg} =====")
+            try:
+                name, path = train_reinforce(**cfg)
+            except Exception as err:
+                # one bad config shouldn't cost you the other 14 runs overnight
+                print(f"!! run failed: {type(err).__name__}: {err} -- skipping to next config")
+                wandb.finish(exit_code=1)
+                continue
+            manifest.append({"run_name": name, "checkpoint": path, **cfg})
+            # rewritten after every run, so a crash still leaves a usable record
+            with open(manifest_path, "w") as f:
+                json.dump(manifest, f, indent=2)
+
+    print(f"\nSweep done: {len(manifest)}/{len(SEEDS) * len(RUNS)} runs succeeded -> {manifest_path}")
 
