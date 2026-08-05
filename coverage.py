@@ -70,6 +70,8 @@ if __name__ == "__main__":
         "MaxRL": "maze_MaxRL_G8_8x8_s0.pth",
         "GRPO": "maze_GRPO_G8_8x8_s0.pth",
         "RLOO": "maze_RLOO_G8_8x8_s0.pth",
+        "Vanilla REINFORCE": "maze_Vanilla_REINFORCE_G1_8x8_s0.pth",
+        "REINFORCE + baseline": "maze_REINFORCE_Baseline_G1_8x8_s0.pth"
     }
 
     test_mazes = build_fixed_eval_set(D=D, num_mazes=NUM_TEST_MAZES, seed=TEST_SEED)

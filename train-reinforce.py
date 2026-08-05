@@ -56,6 +56,10 @@ def train_reinforce(
     USE_FIXED_VAL=True,
     VAL_SEED=12350,
     NUM_VAL_MAZES=50,
+    USE_CRITIC=False, # replace the group statistic with a learned V(s_0) (the thesis knob)
+    BINARY_REWARD=True, # advantages/critic targets use the raw success indicator, not shaped R
+    VALUE_FLOOR=0.05, # 1/p explodes on near-unsolvable mazes -> caps the MaxRL weight at 20
+    CRITIC_WARMUP=20, # updates spent fitting the critic before the policy trusts it
     SEED=0, # train-side RNG seed -> same config, different seed = a repeat, not a duplicate
     TAG="", # free-form suffix so one-off sweep variants are findable in W&B
     WANDB_GROUP=None, # collapses every run of a sweep into one group in the W&B UI
@@ -69,8 +73,10 @@ def train_reinforce(
     # one flat name builder for every algorithm: whatever can differ between two sweep runs
     # (algorithm, group size, lr, seed) has to be in the name, or W&B and the .pth files collide
     run_name = f"RL_{algo_config}_G{CURRENT_GROUP}_{D}x{D}_lr{LEARNING_RATE:g}_s{SEED}-{val_tag}"
-    if USE_BASELINE and ALGORITHM == "REINFORCE":
-        run_name += f"_CC{CRITIC_COEFF}"
+    if USE_CRITIC:
+        # "MaxRL" and "MaxRL + learned V" must never share a run name or a .pth file
+        algo_config += "_V"
+        run_name += "_V"
     if TAG:
         run_name += f"-{TAG}"
 
@@ -98,7 +104,11 @@ def train_reinforce(
             "lr": LEARNING_RATE,
             "max_steps": MAX_STEPS,
             "use_baseline": USE_BASELINE,
-            "critic_coeff": CRITIC_COEFF if USE_BASELINE else 0.0,
+            "critic_coeff": CRITIC_COEFF if (USE_CRITIC or USE_BASELINE) else 0.0,
+            "use_critic": USE_CRITIC,
+            "binary_reward": BINARY_REWARD,
+            "value_floor": VALUE_FLOOR if USE_CRITIC else None,
+            "critic_warmup": CRITIC_WARMUP if USE_CRITIC else 0,
             "entropy_coeff": ENTROPY_COEFF,
             "use_fixed_val": USE_FIXED_VAL,
             "val_seed": VAL_SEED if USE_FIXED_VAL else None,
@@ -139,7 +149,7 @@ def train_reinforce(
         CURRENT_GROUP_SIZE = GROUP_SIZE if ALGORITHM != "REINFORCE" else 1
         N = BATCH_SIZE * CURRENT_GROUP_SIZE # total parallel rollouts we run this update
         # critic head only needed for REINFORCE with baseline for backwards compatibility
-        need_critic = (ALGORITHM == "REINFORCE" and USE_BASELINE)
+        need_critic = USE_CRITIC or (ALGORITHM == "REINFORCE" and USE_BASELINE)
 
         # sample BATCH_SIZE mazes; for each maze, duplicate the layout GROUP_SIZE times so consecutive
         # blocks of GROUP_SIZE rollouts share one maze. that shared block is one "group" for RLOO/GRPO/MaxRL.
@@ -223,37 +233,71 @@ def train_reinforce(
         # exploration: mean policy entropy across every action we actually sampled (prevents premature mode collapse)
         entropy_bonus = (ent * mask).sum() / mask.sum().clamp(min=1.0)
 
-        # reshape rewards to (BATCH_SIZE, GROUP) so each row is one maze's group of rollouts
-        # turns into np array for contiguous efficiency + easy per-group (per-row) math
-        R = total_reward.detach().cpu().numpy().reshape(BATCH_SIZE, CURRENT_GROUP_SIZE)
+        # binary terminal reward: the only thing a verifier would give us in the LLM analogue
+        r_bin = torch.from_numpy(reached.astype(np.float32)).to(device)  # (N,)
+        adv_reward = r_bin if BINARY_REWARD else total_reward.detach()
 
-        value_term = torch.zeros((), device=device) # only REINFORCE with baseline fills this in
+        # reshape rewards to (BATCH_SIZE, GROUP) so each row is one maze's group of rollouts.
+        # built from adv_reward so the group and critic paths are only ever different in the
+        # baseline they use, never in what counts as reward
+        R = adv_reward.cpu().numpy().reshape(BATCH_SIZE, CURRENT_GROUP_SIZE)
+
+        p0_logit, p0 = None, None
+        if USE_CRITIC:
+            # every rollout in a group starts from the same state, so value_steps[0] holds one
+            # copy of that group's V(s_0) per rollout -> no separate forward pass needed
+            p0_logit = value_steps[0]                 # (N,) with grad
+            p0 = torch.sigmoid(p0_logit).detach()     # normalizers must not backprop into the critic
+        critic_ready = USE_CRITIC and global_step >= CRITIC_WARMUP
+
+        value_term = torch.zeros((), device=device) 
 
         if ALGORITHM == "RLOO":
-            # leave-one-out: creates (effectively) a copy of each row but deletes i -> leaving one out,
-            # then subtracts the mean of the others to use as baseline
-            loo_mean = (R.sum(axis=1, keepdims=True) - R) / max(CURRENT_GROUP_SIZE - 1, 1)
-            adv = (R - loo_mean).reshape(-1)
-            adv_t = torch.from_numpy(adv.astype(np.float32)).to(device)
-            # sum_logp is the per-rollout sum of log-probs (or .mean() for length-normalized)
-            # since loss = -pi_theta(a_t | s_t) * A_i from the policy gradient theorem
-            policy_loss = -(adv_t * sum_logp).mean()
+            if critic_ready:
+                # the leave-one-out mean was only ever an estimate of E[R | s_0].
+                # V(s_0) estimates the same quantity from one rollout instead of G-1 others
+                adv_t = adv_reward - p0
+                policy_loss = -(adv_t * sum_logp).mean()
+            else:
+                # leave-one-out: creates (effectively) a copy of each row but deletes i -> leaving one out,
+                # then subtracts the mean of the others to use as baseline
+                loo_mean = (R.sum(axis=1, keepdims=True) - R) / max(CURRENT_GROUP_SIZE - 1, 1)
+                adv = (R - loo_mean).reshape(-1)
+                adv_t = torch.from_numpy(adv.astype(np.float32)).to(device)
+                # sum_logp is the per-rollout sum of log-probs (or .mean() for length-normalized)
+                # since loss = -pi_theta(a_t | s_t) * A_i from the policy gradient theorem
+                policy_loss = -(adv_t * sum_logp).mean()
         elif ALGORITHM == "GRPO":
-            # apply z-score standardization within each group + add a 1e-4 epsilon to prevent dividing by 0
-            g_mean = R.mean(axis=1, keepdims=True)
-            g_std = R.std(axis=1, keepdims=True)
-            adv = ((R - g_mean) / (g_std + 1e-4)).reshape(-1)
-            adv_t = torch.from_numpy(adv.astype(np.float32)).to(device)
-            policy_loss = -(adv_t * sum_logp).mean()
+            if critic_ready:
+                # binary reward => Var[R | s_0] = p(1-p), so the critic's mean pins the normalizer too
+                # and GRPO needs no second-moment head
+                std = torch.sqrt(torch.clamp(p0 * (1.0 - p0), min=1e-4))
+                adv_t = (adv_reward - p0) / (std + 1e-4)
+                policy_loss = -(adv_t * sum_logp).mean()
+            else:
+                # apply z-score standardization within each group + add a 1e-4 epsilon to prevent dividing by 0
+                g_mean = R.mean(axis=1, keepdims=True)
+                g_std = R.std(axis=1, keepdims=True)
+                adv = ((R - g_mean) / (g_std + 1e-4)).reshape(-1)
+                adv_t = torch.from_numpy(adv.astype(np.float32)).to(device)
+                policy_loss = -(adv_t * sum_logp).mean()
         elif ALGORITHM == "MaxRL":
-            # count successful rollouts in each group (K per row) — for MaxRL tracking
-            success_grid = reached.reshape(BATCH_SIZE, CURRENT_GROUP_SIZE).astype(np.float32)
-            K = success_grid.sum(axis=1, keepdims=True)
-            # successes are scaled down inversely by how common success was in the group (1/K);
-            # failed traj or batches carry an advantage of 0
-            adv = np.where((success_grid > 0) & (K > 0), 1.0 / np.maximum(K, 1.0), 0.0).reshape(-1)
-            adv_t = torch.from_numpy(adv.astype(np.float32)).to(device)
-            policy_loss = -(adv_t * sum_logp).mean()
+            if critic_ready:
+                # 1/K was a plug-in estimate of 1/p with p ≈ K/G, so G*V(s_0) substitutes for K.
+                # the G factor keeps the advantage scale matched to the group runs — without it the
+                # effective learning rate jumps 8x and the comparison is confounded
+                p_floor = p0.clamp(min=VALUE_FLOOR)
+                adv_t = adv_reward / (CURRENT_GROUP_SIZE * p_floor)
+                policy_loss = -(adv_t * sum_logp).sum() / BATCH_SIZE
+            else:
+                # count successful rollouts in each group (K per row) — for MaxRL tracking
+                success_grid = reached.reshape(BATCH_SIZE, CURRENT_GROUP_SIZE).astype(np.float32)
+                K = success_grid.sum(axis=1, keepdims=True)
+                # successes are scaled down inversely by how common success was in the group (1/K);
+                # failed traj or batches carry an advantage of 0
+                adv = np.where((success_grid > 0) & (K > 0), 1.0 / np.maximum(K, 1.0), 0.0).reshape(-1)
+                adv_t = torch.from_numpy(adv.astype(np.float32)).to(device)
+                policy_loss = -(adv_t * sum_logp).sum() / BATCH_SIZE
         elif ALGORITHM == "REINFORCE":
             # Calculate discounted reward by iterating in reverse, for all N rollouts at once
             # Horner's method-style G_t = r_t + gamma * G_{t+1}
@@ -283,10 +327,19 @@ def train_reinforce(
             policy_loss = -(logp * advantage * mask).sum(dim=0).mean()
         else:
             raise ValueError(f"Unknown ALGORITHM specified: {ALGORITHM}")
-
+        if USE_CRITIC:
+            # target = did THIS rollout succeed. all G rollouts of a maze share s_0, so BCE over
+            # the batch regresses V(s_0) onto the group's realized K/G — the very statistic the
+            # group methods obtain by brute force
+            value_term = F.binary_cross_entropy_with_logits(p0_logit, r_bin)
         # final loss = policy + (optional critic) - entropy bonus
         loss = policy_loss - ENTROPY_COEFF * entropy_bonus
-        if need_critic:
+        if USE_CRITIC and not critic_ready:
+            # policy sits still while the critic learns what a solvable maze looks like.
+            # unscaled because CRITIC_COEFF exists to stop the critic drowning out the policy,
+            # which is moot while the policy isn't learning
+            loss = value_term
+        elif need_critic:
             # Sharing loss backprop for efficiency, learning the same representation of the maze
             loss = loss + CRITIC_COEFF * value_term
 
@@ -294,6 +347,12 @@ def train_reinforce(
         # (replaces the old gradient accumulation: /BATCH_SIZE so summed grads = MEAN grad over the batch)
         optimizer.zero_grad()
         loss.backward()
+        if USE_CRITIC and not critic_ready:
+            # critic-only phase: keep value gradients out of the BC-warm-started shared trunk
+            for pname, p in model.named_parameters():
+                if not pname.startswith(("fc_critic", "value_head")) and p.grad is not None:
+                    p.grad = None
+
         optimizer.step()
         global_step += 1
 
@@ -310,6 +369,16 @@ def train_reinforce(
         # Create rolling window
         rolling_window = success_history[-100:] # go from last 100 to end
         rolling_success_rate = np.mean(rolling_window) * 100
+
+        # is the critic predicting THIS maze's difficulty, or just the global success rate?
+        # (most meaningful at G>1, where k_grp is a real rate rather than a single 0/1 draw)
+        critic_mae, critic_corr, floor_frac = 0.0, 0.0, 0.0
+        if USE_CRITIC:
+            p_grp = p0.view(BATCH_SIZE, CURRENT_GROUP_SIZE)[:, 0].cpu().numpy()
+            k_grp = reached.reshape(BATCH_SIZE, CURRENT_GROUP_SIZE).mean(axis=1)
+            critic_mae = float(np.abs(p_grp - k_grp).mean())
+            critic_corr = float(np.corrcoef(p_grp, k_grp)[0, 1]) if p_grp.std() > 1e-6 else 0.0
+            floor_frac = float((p0 <= VALUE_FLOOR).float().mean())
 
         if global_step % EVAL_INTERVAL == 0:
             print(f"\n--- Running Three-Metric Validation Suite Checkpoint at Step {global_step} ---")
@@ -338,18 +407,22 @@ def train_reinforce(
 
         if global_step % LOG_INTERVAL == 0:
             print(f"Update {global_step:04d} | Reward: {episode_reward:.2f} | Rolling Success: {rolling_success_rate:.1f}% | Steps: {mean_steps:.1f} | Entropy: {mean_entropy:.4f}")
-
-            # Critic Loss
-            c_loss = batch_c_loss if (ALGORITHM == "REINFORCE" and USE_BASELINE) else 0.0
-
+            if USE_CRITIC:
+                print(f"   critic -> BCE: {batch_c_loss:.4f} | MAE vs K/G: {critic_mae:.3f} | corr: {critic_corr:+.3f} | floored: {floor_frac:.1%}")
+            # Critic Loss — now covers USE_CRITIC runs, not just REINFORCE + baseline
+            c_loss = batch_c_loss if need_critic else 0.0
             wandb.log({
                 "mean_reward": episode_reward,
                 "rolling_train_success_rate": rolling_success_rate,
                 "response_length": mean_steps,
                 "policy_entropy": mean_entropy,
                 "critic_value_loss": c_loss,
+                "critic_mae_vs_group": critic_mae,
+                "critic_corr_vs_group": critic_corr,
+                "critic_floor_frac": floor_frac,
                 "global_step": global_step
             })
+
     
     # save into checkpoints/ when that folder exists (local repo); otherwise cwd (Colab)
     # (out_name was built alongside run_name so the two always agree)
@@ -363,15 +436,27 @@ def train_reinforce(
     return run_name, out_path
 
 if __name__ == "__main__":
-    SWEEP = "coverage_v1"
-    SEEDS = [0, 1, 2]
+    SWEEP = "valuefn_v1"
+    SEEDS = [0] # add 1, 2 once one full pass looks sane — 11 runs now, 33 later
     RUNS = [
-        {"ALGORITHM": "REINFORCE", "USE_BASELINE": False},
-        {"ALGORITHM": "REINFORCE", "USE_BASELINE": True},
+        # arm 1 — group baselines, no critic (reruns so every arm shares this code path)
         {"ALGORITHM": "RLOO",  "GROUP_SIZE": 8},
         {"ALGORITHM": "GRPO",  "GROUP_SIZE": 8},
         {"ALGORITHM": "MaxRL", "GROUP_SIZE": 8},
+        # arm 2 — critic at matched group size: does V help purely as variance reduction?
+        {"ALGORITHM": "RLOO",  "GROUP_SIZE": 8, "USE_CRITIC": True},
+        {"ALGORITHM": "GRPO",  "GROUP_SIZE": 8, "USE_CRITIC": True},
+        {"ALGORITHM": "MaxRL", "GROUP_SIZE": 8, "USE_CRITIC": True},
+        # arm 3 — the thesis: one rollout per maze, SAME total rollouts per update (32*8 = 256)
+        {"ALGORITHM": "RLOO",  "GROUP_SIZE": 1, "USE_CRITIC": True, "BATCH_SIZE": 256},
+        {"ALGORITHM": "GRPO",  "GROUP_SIZE": 1, "USE_CRITIC": True, "BATCH_SIZE": 256},
+        {"ALGORITHM": "MaxRL", "GROUP_SIZE": 1, "USE_CRITIC": True, "BATCH_SIZE": 256},
+        # arm 4 — degenerate G=1 controls: MaxRL collapses to filtered self-imitation,
+        # GRPO's advantage is identically zero (a flat line here is the expected result)
+        {"ALGORITHM": "MaxRL", "GROUP_SIZE": 1, "BATCH_SIZE": 256, "TAG": "selfimitation"},
+        {"ALGORITHM": "GRPO",  "GROUP_SIZE": 1, "BATCH_SIZE": 256, "TAG": "zerograd"},
     ]
+
 
     out_dir = "checkpoints" if os.path.isdir("checkpoints") else "."
     manifest_path = os.path.join(out_dir, f"runs_{SWEEP}.json")
