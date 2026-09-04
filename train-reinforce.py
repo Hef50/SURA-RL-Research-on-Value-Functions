@@ -443,19 +443,12 @@ def train_reinforce(
 
 if __name__ == "__main__":
     SWEEP = "longrun_v1"
-    SEEDS = [0]  # one seed first (§7.6: verify small, then YOLO). Add 1, 2 once the curves look sane.
-    # 2000 updates is the whole point. At 200 the policy has barely left the BC warm-start, and
-    # MaxRL's mechanism - never pushing DOWN a failed rollout - only shows up once RLOO's
-    # negative gradient has had enough updates to actually sharpen the policy onto one mode.
+    SEEDS = [0]  # one seed first 
     COMMON = {"TOTAL_UPDATES": 2000, "EVAL_INTERVAL": 50}
     RUNS = [
         # the headline pair - this is what the acceptance criterion is about
         {"ALGORITHM": "RLOO",  "GROUP_SIZE": 8},
         {"ALGORITHM": "MaxRL", "GROUP_SIZE": 8},
-        # G sweep at MATCHED compute (B*G = 256 either way). MaxRL's per-prompt amplification
-        # is r(p) = (1-(1-p)^G)/p, which saturates at G - so G=8 caps it at 8x while 28.5% of
-        # held-out mazes have p<0.05 and need 20-100x. G=32 also cuts P(K=0) from ~33% to ~5%,
-        # and K=0 groups are exactly the hard mazes MaxRL exists to rescue but gets no gradient from
         {"ALGORITHM": "RLOO",  "GROUP_SIZE": 32, "BATCH_SIZE": 8, "TAG": "G32"},
         {"ALGORITHM": "MaxRL", "GROUP_SIZE": 32, "BATCH_SIZE": 8, "TAG": "G32"},
     ]
@@ -463,7 +456,7 @@ if __name__ == "__main__":
     out_dir = "checkpoints" if os.path.isdir("checkpoints") else "."
     manifest_path = os.path.join(out_dir, f"runs_{SWEEP}.json")
 
-    # resume: a Colab disconnect must not cost the runs that already finished
+    # resume - a Colab disconnect must not cost the runs that already finished
     manifest = json.load(open(manifest_path)) if os.path.exists(manifest_path) else []
     def cfg_key(c):
         return json.dumps({k: v for k, v in c.items()
