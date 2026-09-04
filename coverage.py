@@ -58,10 +58,10 @@ if __name__ == "__main__":
     # held-out test set: a different seed from the VAL_SEED training tunes against,
     # so coverage isn't measured on mazes any run was checkpoint-selected on
     TEST_SEED = 999
-    NUM_TEST_MAZES = 200
+    NUM_TEST_MAZES = 2000
 
-    K_VALUES = [1, 2, 4, 8, 16, 32, 64, 128]
-    N_SAMPLES = 256  # >= 2 * max(K_VALUES) so pass@128 averages over many subsets, not one draw
+    K_VALUES = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512]
+    N_SAMPLES = 1024  # >= 2 * max(K_VALUES) so pass@128 averages over many subsets, not one draw
     CHUNK = 32
 
     # label -> checkpoint filename, built from the sweep manifest so nothing is hand-typed
