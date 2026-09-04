@@ -10,7 +10,7 @@ from environment import MazeEnv
 from bfs_expert import bfs, generate_expert_actions
 from maze_encodings import encode_as_channels, encode_as_single_array, encode_as_2d_channels
 from model import MazeMLP, MazeCNN
-from evaluate import evaluate_model_policy_greedy, evaluate_stochastic_pass_k
+from evaluate import evaluate, EvalMode
 
 # SEED SETTING -- setting a seed so the same code will produce same W&B logs -- comment out if needed
 # seed = 42

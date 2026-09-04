@@ -58,16 +58,19 @@ if __name__ == "__main__":
     # held-out test set: a different seed from the VAL_SEED training tunes against,
     # so coverage isn't measured on mazes any run was checkpoint-selected on
     TEST_SEED = 999
-    NUM_TEST_MAZES = 2000
+    NUM_TEST_MAZES = 200
 
     K_VALUES = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512]
-    N_SAMPLES = 1024  # >= 2 * max(K_VALUES) so pass@128 averages over many subsets, not one draw
-    CHUNK = 32
+    N_SAMPLES = 1024  # >= 2 * max(K_VALUES) so pass@512 averages over many subsets, not one draw
+    CHUNK = 64
 
     # label -> checkpoint filename, built from the sweep manifest so nothing is hand-typed
-    SWEEP = "valuefn_v1"
-    with open(resolve_path(f"runs_{SWEEP}.json")) as f:
-        runs = [r for r in json.load(f) if r["SEED"] == 0]
+    SWEEP = "longrun_v1"
+    manifest_file = resolve_path(f"runs_{SWEEP}.json")
+    if not os.path.exists(manifest_file):
+        raise SystemExit(f"No sweep manifest at {manifest_file} -- run train-reinforce.py first.")
+    with open(manifest_file) as f:
+        runs = json.load(f)
     def label_of(r):
         name = r["ALGORITHM"] + (" + V" if r.get("USE_CRITIC") else "")
         name += f" (G={r.get('GROUP_SIZE', 8)})"

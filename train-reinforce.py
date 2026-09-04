@@ -7,6 +7,7 @@ import torch.nn.functional as F
 import torch.optim as optim
 import numpy as np
 import wandb
+import time
 
 from environment import MazeEnv, VecMazeEnv
 from maze_encodings import encode_as_2d_channels, encode_batch
@@ -55,7 +56,7 @@ def train_reinforce(
     ENTROPY_COEFF=0.01, # Exploration coefficient (beta) to scale the policy entropy bonus, preventing premature mode collapse
     USE_FIXED_VAL=True,
     VAL_SEED=12350,
-    NUM_VAL_MAZES=50,
+    NUM_VAL_MAZES=100,
     USE_CRITIC=False, # replace the group statistic with a learned V(s_0) (the thesis knob)
     BINARY_REWARD=True, # advantages/critic targets use the raw success indicator, not shaped R
     VALUE_FLOOR=0.05, # 1/p explodes on near-unsolvable mazes -> caps the MaxRL weight at 20
@@ -145,6 +146,11 @@ def train_reinforce(
     print("Beginning on-policy RL optimization loop...")
 
     for update in range(TOTAL_UPDATES):
+        if update == 0:
+            t_start = time.time()
+        elif update == 20:
+            per_update = (time.time() - t_start) / 20
+            print(f"[timing] {per_update:.3f}s/update -> ~{per_update * TOTAL_UPDATES / 60:.1f} min for this run")
         model.train() # set to training mode so parameters track autograd updates
         CURRENT_GROUP_SIZE = GROUP_SIZE if ALGORITHM != "REINFORCE" else 1
         N = BATCH_SIZE * CURRENT_GROUP_SIZE # total parallel rollouts we run this update
@@ -392,7 +398,7 @@ def train_reinforce(
             
             val_pass_k = evaluate(model, val_env, encode_as_2d_channels, num_mazes=NUM_VAL_MAZES, mode=EvalMode.PASS_K, N=10, max_steps=MAX_STEPS, modeltype="CNN", fixed_mazes=fixed_val_mazes)
             
-            val_mean_1 = evaluate(model, val_env, encode_as_2d_channels, num_mazes=NUM_VAL_MAZES, mode=EvalMode.MEAN_K, N=1, max_steps=MAX_STEPS, modeltype="CNN", fixed_mazes=fixed_val_mazes)
+            val_mean_1 = evaluate(model, val_env, encode_as_2d_channels, num_mazes=NUM_VAL_MAZES, mode=EvalMode.MEAN_K, N=16, max_steps=MAX_STEPS, modeltype="CNN", fixed_mazes=fixed_val_mazes)
 
             print(f"Validation Rates -> Greedy: {val_greedy_rate:.1f}% | Stochastic Pass@10: {val_pass_k:.1f}% | Stochastic Mean@1: {val_mean_1:.1f}%\n")
 
@@ -436,47 +442,51 @@ def train_reinforce(
     return run_name, out_path
 
 if __name__ == "__main__":
-    SWEEP = "valuefn_v1"
-    SEEDS = [0] # add 1, 2 once one full pass looks sane — 11 runs now, 33 later
+    SWEEP = "longrun_v1"
+    SEEDS = [0]  # one seed first (§7.6: verify small, then YOLO). Add 1, 2 once the curves look sane.
+    # 2000 updates is the whole point. At 200 the policy has barely left the BC warm-start, and
+    # MaxRL's mechanism - never pushing DOWN a failed rollout - only shows up once RLOO's
+    # negative gradient has had enough updates to actually sharpen the policy onto one mode.
+    COMMON = {"TOTAL_UPDATES": 2000, "EVAL_INTERVAL": 50}
     RUNS = [
-        # arm 1 — group baselines, no critic (reruns so every arm shares this code path)
+        # the headline pair - this is what the acceptance criterion is about
         {"ALGORITHM": "RLOO",  "GROUP_SIZE": 8},
-        {"ALGORITHM": "GRPO",  "GROUP_SIZE": 8},
         {"ALGORITHM": "MaxRL", "GROUP_SIZE": 8},
-        # arm 2 — critic at matched group size: does V help purely as variance reduction?
-        {"ALGORITHM": "RLOO",  "GROUP_SIZE": 8, "USE_CRITIC": True},
-        {"ALGORITHM": "GRPO",  "GROUP_SIZE": 8, "USE_CRITIC": True},
-        {"ALGORITHM": "MaxRL", "GROUP_SIZE": 8, "USE_CRITIC": True},
-        # arm 3 — the thesis: one rollout per maze, SAME total rollouts per update (32*8 = 256)
-        {"ALGORITHM": "RLOO",  "GROUP_SIZE": 1, "USE_CRITIC": True, "BATCH_SIZE": 256},
-        {"ALGORITHM": "GRPO",  "GROUP_SIZE": 1, "USE_CRITIC": True, "BATCH_SIZE": 256},
-        {"ALGORITHM": "MaxRL", "GROUP_SIZE": 1, "USE_CRITIC": True, "BATCH_SIZE": 256},
-        # arm 4 — degenerate G=1 controls: MaxRL collapses to filtered self-imitation,
-        # GRPO's advantage is identically zero (a flat line here is the expected result)
-        {"ALGORITHM": "MaxRL", "GROUP_SIZE": 1, "BATCH_SIZE": 256, "TAG": "selfimitation"},
-        {"ALGORITHM": "GRPO",  "GROUP_SIZE": 1, "BATCH_SIZE": 256, "TAG": "zerograd"},
+        # G sweep at MATCHED compute (B*G = 256 either way). MaxRL's per-prompt amplification
+        # is r(p) = (1-(1-p)^G)/p, which saturates at G - so G=8 caps it at 8x while 28.5% of
+        # held-out mazes have p<0.05 and need 20-100x. G=32 also cuts P(K=0) from ~33% to ~5%,
+        # and K=0 groups are exactly the hard mazes MaxRL exists to rescue but gets no gradient from
+        {"ALGORITHM": "RLOO",  "GROUP_SIZE": 32, "BATCH_SIZE": 8, "TAG": "G32"},
+        {"ALGORITHM": "MaxRL", "GROUP_SIZE": 32, "BATCH_SIZE": 8, "TAG": "G32"},
     ]
-
 
     out_dir = "checkpoints" if os.path.isdir("checkpoints") else "."
     manifest_path = os.path.join(out_dir, f"runs_{SWEEP}.json")
-    manifest = []
+
+    # resume: a Colab disconnect must not cost the runs that already finished
+    manifest = json.load(open(manifest_path)) if os.path.exists(manifest_path) else []
+    def cfg_key(c):
+        return json.dumps({k: v for k, v in c.items()
+                           if k not in ("run_name", "checkpoint")}, sort_keys=True)
+    done = {cfg_key(m) for m in manifest}
 
     for seed in SEEDS:
         for run in RUNS:
-            cfg = {"WANDB_GROUP": SWEEP, "SEED": seed, **run}
+            cfg = {"WANDB_GROUP": SWEEP, "SEED": seed, **COMMON, **run}
+            if cfg_key(cfg) in done:
+                print(f"== skipping already-finished run: {cfg}")
+                continue
             print(f"\n===== sweep {SWEEP} | run {len(manifest) + 1} | {cfg} =====")
             try:
                 name, path = train_reinforce(**cfg)
             except Exception as err:
-                # one bad config shouldn't cost you the other 14 runs overnight
+                # one bad config shouldn't cost you the other runs overnight
                 print(f"!! run failed: {type(err).__name__}: {err} -- skipping to next config")
                 wandb.finish(exit_code=1)
                 continue
             manifest.append({"run_name": name, "checkpoint": path, **cfg})
-            # rewritten after every run, so a crash still leaves a usable record
             with open(manifest_path, "w") as f:
                 json.dump(manifest, f, indent=2)
 
-    print(f"\nSweep done: {len(manifest)}/{len(SEEDS) * len(RUNS)} runs succeeded -> {manifest_path}")
+    print(f"\nSweep done: {len(manifest)} runs recorded -> {manifest_path}")
 
