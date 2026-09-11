@@ -61,6 +61,8 @@ def train_reinforce(
     BINARY_REWARD=True, # advantages/critic targets use the raw success indicator, not shaped R
     VALUE_FLOOR=0.05, # 1/p explodes on near-unsolvable mazes -> caps the MaxRL weight at 20
     CRITIC_WARMUP=20, # updates spent fitting the critic before the policy trusts it
+    IN_CHANNELS=4, # 4 = walls/agent/goal/timestep. 3 = the old encoding, for the ablation.
+    STARTER=None,  # defaults by channel count, so a 3ch run can't load a 4ch warm-start
     SEED=0, # train-side RNG seed -> same config, different seed = a repeat, not a duplicate
     TAG="", # free-form suffix so one-off sweep variants are findable in W&B
     WANDB_GROUP=None, # collapses every run of a sweep into one group in the W&B UI
@@ -78,6 +80,11 @@ def train_reinforce(
         # "MaxRL" and "MaxRL + learned V" must never share a run name or a .pth file
         algo_config += "_V"
         run_name += "_V"
+    if IN_CHANNELS != 4:
+        # a 3-channel ablation run must never share a run name or a .pth with its 4-channel
+        # twin - same algorithm, group size, and seed, so TAG is the only thing left
+        # to separate them. Folding it into TAG means out_name picks it up automatically.
+        TAG = f"{TAG}_c{IN_CHANNELS}" if TAG else f"c{IN_CHANNELS}"
     if TAG:
         run_name += f"-{TAG}"
 
@@ -99,6 +106,7 @@ def train_reinforce(
             "batch_size": BATCH_SIZE,
             "total_updates": TOTAL_UPDATES,
             "grid_size": D,
+            "in_channels": IN_CHANNELS,
             "algorithm": algo_config,
             "group_size": CURRENT_GROUP,
             "gamma": GAMMA,
@@ -129,13 +137,17 @@ def train_reinforce(
 
 
     # Load model to graphics card memory (VRAM)
-    model = MazeCNN(d=D, hidden_dim=128).to(device)
+    model = MazeCNN(d=D, hidden_dim=128, in_channels=IN_CHANNELS).to(device)
 
-    # Loads model to VRAM (checkpoints/BFS_BC_CNN-RL-starter.pth, or same folder on Colab)
-    # Strict=false acknowledges that starter doesn't have values for fc_critic, etc. but that's okay
-    starter_path = resolve_path("BFS_BC_CNN-RL-starter.pth")
+    # The warm-start has to match the architecture: conv1.weight is [32, IN_CHANNELS, 3, 3],
+    # and load_state_dict(strict=False) does NOT forgive a shape mismatch on a key that
+    # exists - it only relaxes missing/unexpected keys. 
+    # So derive the file from the channel count rather than trusting the caller
+    starter_file = STARTER or ("BFS_BC_CNN-RL-starter.pth" if IN_CHANNELS == 4
+                               else "BFS_BC_CNN-RL-starter-3ch.pth")
+    starter_path = resolve_path(starter_file)
     model.load_state_dict(torch.load(starter_path, map_location=device), strict=False)
-    print(f"Loaded warm-start maze_CNN baseline from {starter_path}.")
+    print(f"Loaded {IN_CHANNELS}-channel warm-start from {starter_path}.")
 
     optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE)
     global_step = 0
@@ -143,7 +155,12 @@ def train_reinforce(
     # Initialize success tracking window
     success_history = [] 
 
-    print("Beginning on-policy RL optimization loop...")
+    # resolved BEFORE the loop because the mid-run snapshot writes to it every 250 updates
+    # (out_name was built alongside run_name so the two always agree)
+    out_dir = "checkpoints" if os.path.isdir("checkpoints") else "."
+    out_path = os.path.join(out_dir, out_name)
+
+    print("Beginning on-policy RL optimization loop...") 
 
     for update in range(TOTAL_UPDATES):
         if update == 0:
@@ -182,9 +199,13 @@ def train_reinforce(
             if not active.any():
                 break # everyone finished early, no point looping the rest of MAX_STEPS
 
-            # (N, 3, D, D) snapshot of every current state
+            # (N, C, D, D) snapshot of every current state
             # np array for C-style contiguous memory allocation, dtype float32 for casting bc that's what model uses
-            states = encode_batch(venv.mazes, venv.agent, venv.goal)
+            # t is the loop variable - every rollout in the batch is at the SAME timestep,
+            # because VecMazeEnv.steps is one global counter and finished rollouts are frozen
+            # by the done mask. IN_CHANNELS==3 passes t=None and reproduces the old encoding.
+            states = encode_batch(venv.mazes, venv.agent, venv.goal,
+                                  t=(t if IN_CHANNELS == 4 else None), max_steps=MAX_STEPS)
             # Tensor object cast to track gradients and do fast matrix multiplication; allocate to GPU before the forward pass
             state_tensor = torch.from_numpy(states).to(device) # encode_batch already hands us float32
 
@@ -248,6 +269,27 @@ def train_reinforce(
         # baseline they use, never in what counts as reward
         R = adv_reward.cpu().numpy().reshape(BATCH_SIZE, CURRENT_GROUP_SIZE)
 
+        # group success counts, pulled up out of the MaxRL branch so GRPO runs get them too.
+        # built from reached, not R -> same thing while BINARY_REWARD=True, but they'd split
+        # the moment it flips (MaxRL's K stays binary, RLOO/GRPO go shaped)
+        success_grid = reached.reshape(BATCH_SIZE, CURRENT_GROUP_SIZE).astype(np.float32)
+        K_per_group = success_grid.sum(axis=1) # (B,) successes per maze
+
+        # at GROUP_SIZE=32 every group already IS 32 samples of one maze,
+        # so "pass@32 over the batch" costs zero extra rollouts — it's just a reduction over
+        # the success grid we already computed for the advantage
+        train_pass_1 = float(reached.mean())            # mean over all N rollouts
+        train_pass_G = float((K_per_group >= 1).mean()) # any-of-G, per maze
+
+        # the two dead populations. binary reward => all-fail and all-succeed groups both have
+        # sigma = 0 AND R - mu = 0, so GRPO's advantage is identically zero on both and they
+        # contribute no gradient at all. MaxRL still learns from K=G (each success gets 1/K,
+        # sums to 1) -> as success climbs frac_K_all grows, GRPO's effective batch shrinks,
+        # and that's the mechanism behind the crossover we're looking for
+        frac_K_zero = float((K_per_group == 0).mean())
+        frac_K_all  = float((K_per_group == CURRENT_GROUP_SIZE).mean())
+
+
         p0_logit, p0 = None, None
         if USE_CRITIC:
             # every rollout in a group starts from the same state, so value_steps[0] holds one
@@ -296,9 +338,8 @@ def train_reinforce(
                 adv_t = adv_reward / (CURRENT_GROUP_SIZE * p_floor)
                 policy_loss = -(adv_t * sum_logp).sum() / BATCH_SIZE
             else:
-                # count successful rollouts in each group (K per row) — for MaxRL tracking
-                success_grid = reached.reshape(BATCH_SIZE, CURRENT_GROUP_SIZE).astype(np.float32)
-                K = success_grid.sum(axis=1, keepdims=True)
+                # success_grid / K_per_group come from up top now so every algorithm logs them
+                K = K_per_group[:, None] # (B,1) to broadcast back against success_grid (B,G)
                 # successes are scaled down inversely by how common success was in the group (1/K);
                 # failed traj or batches carry an advantage of 0
                 adv = np.where((success_grid > 0) & (K > 0), 1.0 / np.maximum(K, 1.0), 0.0).reshape(-1)
@@ -420,6 +461,14 @@ def train_reinforce(
             wandb.log({
                 "mean_reward": episode_reward,
                 "rolling_train_success_rate": rolling_success_rate,
+                # pass@1 / pass@32 measured on the training batch
+                # rolling_train_success_rate above is already pass@1 smoothed over 100 updates;
+                # read the crossover off that one, the raw per-update value is too noisy at B=32
+                "train_pass_1": train_pass_1,
+                "train_pass_G": train_pass_G,
+                "frac_K_zero": frac_K_zero,
+                "frac_K_all": frac_K_all,
+                "K_mean": float(K_per_group.mean()),
                 "response_length": mean_steps,
                 "policy_entropy": mean_entropy,
                 "critic_value_loss": c_loss,
@@ -428,12 +477,14 @@ def train_reinforce(
                 "critic_floor_frac": floor_frac,
                 "global_step": global_step
             })
+        if global_step % 250 == 0:
+            # mid-run snapshot - these runs are 45-70 min and Colab drops sessions, so a
+            # disconnect at update 1900 currently costs the whole run. W&B curves survive a
+            # disconnect on their own; the weights don't
+            torch.save(model.state_dict(), out_path)
 
     
-    # save into checkpoints/ when that folder exists (local repo); otherwise cwd (Colab)
-    # (out_name was built alongside run_name so the two always agree)
-    out_dir = "checkpoints" if os.path.isdir("checkpoints") else "."
-    out_path = os.path.join(out_dir, out_name)
+    # final save - out_path resolved up top so the mid-run snapshot could share it
     torch.save(model.state_dict(), out_path)
     print(f"{run_name} complete. Weights saved to {out_path}!")
 
@@ -442,15 +493,23 @@ def train_reinforce(
     return run_name, out_path
 
 if __name__ == "__main__":
-    SWEEP = "longrun_v1"
-    SEEDS = [0]  # one seed first 
-    COMMON = {"TOTAL_UPDATES": 2000, "EVAL_INTERVAL": 50}
+    SWEEP = "crossover_v1"
+    SEEDS = [0] # one seed first, add 1/2 once the crossover actually shows up
+    # G=32 - B=32 keeps 32 groups per update, which is
+    # what makes the per-update pass@32 readable -> N = 1024 rollouts/update, 4x last sweep
+    COMMON = {"TOTAL_UPDATES": 2000, "EVAL_INTERVAL": 50, "BATCH_SIZE": 32, "GROUP_SIZE": 32}
     RUNS = [
-        # the headline pair - this is what the acceptance criterion is about
-        {"ALGORITHM": "RLOO",  "GROUP_SIZE": 8},
-        {"ALGORITHM": "MaxRL", "GROUP_SIZE": 8},
-        {"ALGORITHM": "RLOO",  "GROUP_SIZE": 32, "BATCH_SIZE": 8, "TAG": "G32"},
-        {"ALGORITHM": "MaxRL", "GROUP_SIZE": 32, "BATCH_SIZE": 8, "TAG": "G32"},
+        # the deliverable — where does MaxRL's pass@1 cross GRPO's? ordered first so a dropped
+        # Colab session still leaves us the one result Week 8 actually asked for
+        {"ALGORITHM": "GRPO"},
+        {"ALGORITHM": "MaxRL"},
+        # "same with baselines" — does the critic version cross at the same point?
+        {"ALGORITHM": "GRPO",  "USE_CRITIC": True},
+        {"ALGORITHM": "MaxRL", "USE_CRITIC": True},
+        # did the timestep channel earn its place? matched 3ch control, loads the old starter
+        # automatically (see the starter_file switch) -> the only difference is the 4th channel
+        {"ALGORITHM": "GRPO",  "IN_CHANNELS": 3},
+        {"ALGORITHM": "MaxRL", "IN_CHANNELS": 3},
     ]
 
     out_dir = "checkpoints" if os.path.isdir("checkpoints") else "."
