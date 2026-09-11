@@ -24,7 +24,7 @@ class MazeMLP(nn.Module):
         return self.network(x)
 
 class MazeCNN(nn.Module):
-    def __init__(self, d=7, hidden_dim=128):
+    def __init__(self, d=7, hidden_dim=128, in_channels=4):
         super(MazeCNN, self).__init__()
 
         # NO POOLING HERE bc 8x8 too small, pooling mostly for images and classification for position invariance
@@ -32,7 +32,7 @@ class MazeCNN(nn.Module):
 
         # layer 1 - processes the 3 raw channels into 32 spatial feature maps
         # using padding=1 preserves the width and height of the grid boundary
-        self.conv1 = nn.Conv2d(in_channels=3, out_channels=32, kernel_size=3, padding=1)
+        self.conv1 = nn.Conv2d(in_channels=in_channels, out_channels=32, kernel_size=3, padding=1)
         self.relu1 = nn.ReLU()
 
         # layer 2 - deepens feature extraction from 32 maps to 64 maps

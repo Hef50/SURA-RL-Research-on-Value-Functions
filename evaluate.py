@@ -96,15 +96,21 @@ def evaluate(model, env, encoding_fn, num_mazes=100, mode=EvalMode.GREEDY,
     reached = np.zeros(M, dtype=bool)
     wrong_stop = np.zeros(M, dtype=bool)
 
+    # Infer the channel count from the model instead of taking it as an argument, so eval can
+    # never disagree with training about whether the timestep channel is present. A silent
+    # mismatch here would corrupt every eval without any errors.
+    use_t = (modeltype == "CNN" and model.conv1.in_channels == 4)
+
     with torch.no_grad():
-        for _ in range(max_steps):
+        for t in range(max_steps):
             active = ~venv.done # who's still running at the start of this step
             if not active.any():
                 break # everyone finished, no point looping the rest of max_steps
 
-            # [] for (3D^2) -> batched: encode_batch builds (M, 3, D, D) contiguous float32,
+            # [] for (3D^2) -> batched: encode_batch builds (M, C, D, D) contiguous float32,
             # then Tensor cast for fast matrix multiplication / model input
-            states = encode_batch(venv.mazes, venv.agent, venv.goal) # (M, 3, D, D)
+            states = encode_batch(venv.mazes, venv.agent, venv.goal,
+                                  t=(t if use_t else None), max_steps=max_steps) # (M, C, D, D)
             if modeltype == "MLP":
                 # flatten channels the same way encode_as_channels does (walls | agent | goal)
                 state_tensor = torch.from_numpy(states.reshape(M, -1)).to(device)

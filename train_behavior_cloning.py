@@ -13,10 +13,10 @@ from model import MazeMLP, MazeCNN
 from evaluate import evaluate, EvalMode
 
 # SEED SETTING -- setting a seed so the same code will produce same W&B logs -- comment out if needed
-# seed = 42
-# random.seed(seed)
-# np.random.seed(seed)
-# torch.manual_seed(seed)
+seed = 42
+random.seed(seed)
+np.random.seed(seed)
+torch.manual_seed(seed)
 
 class MazeDataset(Dataset):
     # Inherits from PyTorch Dataset for efficient Neural Net Training
@@ -30,7 +30,7 @@ class MazeDataset(Dataset):
     def __getitem__(self, idx):
         return self.states[idx], self.actions[idx]
 
-def collect_expert_data(num_mazes, D, encoding_fn, max_steps=50):
+def collect_expert_data(num_mazes, D, encoding_fn, max_steps=60, use_timestep=True):
     env = MazeEnv(D=D, max_steps=max_steps)
     states = []
     actions = []
@@ -44,8 +44,25 @@ def collect_expert_data(num_mazes, D, encoding_fn, max_steps=50):
 
         expert_actions = generate_expert_actions(cell_path)
 
-        for action in expert_actions:
-            current_state_vector = encoding_fn(env.maze, env.agent_pos, env.goal_pos)
+        # Randomized timestep offset. The BFS expert only ever produces SHORTEST paths
+        # (median ~8 steps on 8x8, max ~19), so without this BC would only ever see
+        # t/max_steps in [0, 0.33] while RL rollouts reach 0.98 - the warm-start would be
+        # extrapolating on the brand-new channel from update 1. Sampling an offset covers the
+        # full input range with expert-correct labels.
+
+        # Defensible because for this MDP the optimal ACTION is essentially t-independent
+        # (follow the shortest path; there is nothing better to do as the clock runs out),
+        # while V(s,t) is strongly t-dependent - which is exactly why the timestep matters
+        # more for value estimation than for the policy.
+        t_offset = int(np.random.randint(0, max(1, max_steps - len(expert_actions))))
+
+        for i, action in enumerate(expert_actions):
+            if use_timestep:
+                current_state_vector = encoding_fn(env.maze, env.agent_pos, env.goal_pos,
+                                                   t=t_offset + i, max_steps=max_steps)
+            else:
+                # legacy MLP path -- encode_as_channels has no timestep argument
+                current_state_vector = encoding_fn(env.maze, env.agent_pos, env.goal_pos)
             # add snapshot to states and actions history list
             states.append(current_state_vector)
             actions.append(int(action)) # turns action into an int to turn into float later for NN training
@@ -58,13 +75,13 @@ def collect_expert_data(num_mazes, D, encoding_fn, max_steps=50):
 def train_behavioral_cloning():
     D = 8
     # 15 epochs is solid balance for small grids
-    EPOCHS = 1
+    EPOCHS = 3
     BATCH_SIZE = 32 # efficient batch without overloading mem
     HIDDEN_DIM = 128 # should be enough to learn parmaeters
     LEARNING_RATE = 0.001
     NUM_TRAIN_MAZES = 750
     NUM_VAL_MAZES = NUM_TRAIN_MAZES // 4 # for 80-20 cross validation
-    MAX_STEPS = 50 
+    MAX_STEPS = 60 
     NUM_LAYERS = 2 # tunable knob for MLP, hardcoded to 2 for CNNs in current code
     MODEL_TYPE = "CNN"
 
@@ -91,13 +108,23 @@ def train_behavioral_cloning():
         # For MLP runs:
         # train = expert states tensor
         # for 80-20 cross-validation
-        train_states, train_actions = collect_expert_data(num_mazes=NUM_TRAIN_MAZES, D=D, encoding_fn=encode_as_channels, max_steps=MAX_STEPS)
-        val_states, val_actions = collect_expert_data(num_mazes=NUM_VAL_MAZES, D=D, encoding_fn=encode_as_channels, max_steps=MAX_STEPS)
+        train_states, train_actions = collect_expert_data(num_mazes=NUM_TRAIN_MAZES, D=D, 
+                                                          encoding_fn=encode_as_channels, 
+                                                          max_steps=MAX_STEPS, 
+                                                          use_timestep=False)
+        val_states, val_actions = collect_expert_data(num_mazes=NUM_VAL_MAZES, D=D, 
+                                                      encoding_fn=encode_as_channels, 
+                                                      max_steps=MAX_STEPS, 
+                                                      use_timestep=False)
         eval_encoder = encode_as_channels
         model = MazeMLP(input_dim=train_states.shape[1], hidden_dim=HIDDEN_DIM, num_layers=NUM_LAYERS)
     elif MODEL_TYPE == "CNN":
-        train_states, train_actions = collect_expert_data(num_mazes=NUM_TRAIN_MAZES, D=D, encoding_fn=encode_as_2d_channels, max_steps=MAX_STEPS)
-        val_states, val_actions = collect_expert_data(num_mazes=NUM_VAL_MAZES, D=D, encoding_fn=encode_as_2d_channels, max_steps=MAX_STEPS)
+        train_states, train_actions = collect_expert_data(num_mazes=NUM_TRAIN_MAZES, D=D, 
+                                                          encoding_fn=encode_as_2d_channels, 
+                                                          max_steps=MAX_STEPS)
+        val_states, val_actions = collect_expert_data(num_mazes=NUM_VAL_MAZES, D=D, 
+                                                      encoding_fn=encode_as_2d_channels, 
+                                                      max_steps=MAX_STEPS)
         eval_encoder = encode_as_2d_channels
         model = MazeCNN(d=D, hidden_dim=HIDDEN_DIM)
     else:
@@ -128,7 +155,7 @@ def train_behavioral_cloning():
             optimizer.zero_grad()
 
             # training batch has expert data
-            logits = model(batch_states)
+            logits, _ = model(batch_states, need_critic=False)
             # loss var stores pointer to logits and model
             loss = criterion(logits, batch_actions) 
 
@@ -138,6 +165,11 @@ def train_behavioral_cloning():
             optimizer.step()
             global_step += 1 # incremented bc optimizer step is incremented above
 
+            if global_step % 50 == 0:
+                import os
+                _dir = "checkpoints" if os.path.isdir("checkpoints") else "."
+                torch.save(model.state_dict(), os.path.join(_dir, f"maze_CNN_s{global_step}.pth"))
+            
             # .item() extracts float loss value 
             # total loss = average loss per sample * number of samaples in batch
             total_train_loss += loss.item() * batch_states.size(0)
@@ -171,7 +203,7 @@ def train_behavioral_cloning():
 
         with torch.no_grad():
             for batch_states, batch_actions in val_loader:
-                logits = model(batch_states)
+                logits, _ = model(batch_states, need_critic=False)
                 loss = criterion(logits, batch_actions)
 
                 total_val_loss += loss.item() * batch_states.size(0)
@@ -182,23 +214,17 @@ def train_behavioral_cloning():
         val_acc = (correct_val / len(val_states)) * 100
 
         print("Executing physical rollout simulations on validation mazes...")
-        greedy_success = evaluate_model_policy_greedy(
-            model=model, 
-            env=val_env, 
-            encoding_fn=eval_encoder, 
-            num_mazes=50, 
-            max_steps=MAX_STEPS,
-            modeltype=MODEL_TYPE
+        greedy_stats = evaluate(
+            model, val_env, eval_encoder,
+            num_mazes=50, mode=EvalMode.GREEDY,
+            max_steps=MAX_STEPS, modeltype=MODEL_TYPE, return_stats=True,
         )
+        greedy_success = greedy_stats["rate"]
 
-        stochastic_success = evaluate_stochastic_pass_k(
-            model=model, 
-            env=val_env, 
-            encoding_fn=eval_encoder,
-            num_mazes=50, 
-            N=10, 
-            max_steps=MAX_STEPS,
-            modeltype=MODEL_TYPE
+        stochastic_success = evaluate(
+            model, val_env, eval_encoder,
+            num_mazes=50, mode=EvalMode.PASS_K, N=10,
+            max_steps=MAX_STEPS, modeltype=MODEL_TYPE,
         )
 
         # epoch + 1 to number at 1
