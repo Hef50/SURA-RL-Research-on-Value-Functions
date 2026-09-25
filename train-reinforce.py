@@ -127,6 +127,11 @@ def train_reinforce(
         }
     )
 
+    # make global_step the x-axis for everything
+    wandb.define_metric("global_step")
+    wandb.define_metric("*", step_metric="global_step")
+
+
     env = MazeEnv(D=D, max_steps=MAX_STEPS)
     val_env = MazeEnv(D=D, max_steps=MAX_STEPS)
     fixed_val_mazes = (
@@ -160,14 +165,19 @@ def train_reinforce(
     out_dir = "checkpoints" if os.path.isdir("checkpoints") else "."
     out_path = os.path.join(out_dir, out_name)
 
+    # progress reporting is TIME-based, not update-based, so the cadence stays ~constant
+    # regardless of what s/update turns out to be on whatever GPU we land on
+    PROGRESS_EVERY_S = 30
+    t_start = time.time()
+    t_last_report = t_start
+
     print("Beginning on-policy RL optimization loop...") 
 
     for update in range(TOTAL_UPDATES):
-        if update == 0:
-            t_start = time.time()
-        elif update == 20:
+        if update == 20:
+            # early read so you can decide whether to walk away, before the first [progress] line
             per_update = (time.time() - t_start) / 20
-            print(f"[timing] {per_update:.3f}s/update -> ~{per_update * TOTAL_UPDATES / 60:.1f} min for this run")
+            print(f"[timing] {per_update:.3f}s/update -> ~{per_update * TOTAL_UPDATES / 60:.1f} min for this run", flush=True)
         model.train() # set to training mode so parameters track autograd updates
         CURRENT_GROUP_SIZE = GROUP_SIZE if ALGORITHM != "REINFORCE" else 1
         N = BATCH_SIZE * CURRENT_GROUP_SIZE # total parallel rollouts we run this update
@@ -483,6 +493,19 @@ def train_reinforce(
             # disconnect on their own; the weights don't
             torch.save(model.state_dict(), out_path)
 
+        # periodic ETA. the rate is averaged over the WHOLE run rather than the last window:
+        # eval fires every EVAL_INTERVAL and cudnn autotunes on the first few updates, so short
+        # windows read jumpy, while the per-update cost is otherwise flat here
+        now = time.time()
+        if now - t_last_report >= PROGRESS_EVERY_S:
+            done = update + 1
+            rate = (now - t_start) / done
+            eta_m = (TOTAL_UPDATES - done) * rate / 60.0
+            print(f"[progress] {done}/{TOTAL_UPDATES} ({100.0*done/TOTAL_UPDATES:.1f}%) | "
+                  f"{rate:.3f}s/update | elapsed {(now - t_start)/60:.1f}m | "
+                  f"ETA {eta_m:.1f}m (this run)", flush=True)
+            t_last_report = now
+
     
     # final save - out_path resolved up top so the mid-run snapshot could share it
     torch.save(model.state_dict(), out_path)
@@ -493,23 +516,16 @@ def train_reinforce(
     return run_name, out_path
 
 if __name__ == "__main__":
-    SWEEP = "crossover_v1"
+    SWEEP = "crossover_long_v1"
     SEEDS = [0] # one seed first, add 1/2 once the crossover actually shows up
     # G=32 - B=32 keeps 32 groups per update, which is
     # what makes the per-update pass@32 readable -> N = 1024 rollouts/update, 4x last sweep
-    COMMON = {"TOTAL_UPDATES": 2000, "EVAL_INTERVAL": 50, "BATCH_SIZE": 32, "GROUP_SIZE": 32}
+    COMMON = {"TOTAL_UPDATES": 8000, "EVAL_INTERVAL": 50, "BATCH_SIZE": 32, "GROUP_SIZE": 32}
     RUNS = [
         # the deliverable — where does MaxRL's pass@1 cross GRPO's? ordered first so a dropped
         # Colab session still leaves us the one result Week 8 actually asked for
         {"ALGORITHM": "GRPO"},
         {"ALGORITHM": "MaxRL"},
-        # "same with baselines" — does the critic version cross at the same point?
-        {"ALGORITHM": "GRPO",  "USE_CRITIC": True},
-        {"ALGORITHM": "MaxRL", "USE_CRITIC": True},
-        # did the timestep channel earn its place? matched 3ch control, loads the old starter
-        # automatically (see the starter_file switch) -> the only difference is the 4th channel
-        {"ALGORITHM": "GRPO",  "IN_CHANNELS": 3},
-        {"ALGORITHM": "MaxRL", "IN_CHANNELS": 3},
     ]
 
     out_dir = "checkpoints" if os.path.isdir("checkpoints") else "."
