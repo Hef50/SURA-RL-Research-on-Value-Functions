@@ -69,13 +69,17 @@ def train_reinforce(
 ):
     set_seed(SEED)
 
+
+    # RUN NAMING - give every run a unique name
     algo_config = ALGORITHM if ALGORITHM != "REINFORCE" else ("REINFORCE_Baseline" if USE_BASELINE else "Vanilla_REINFORCE")
     CURRENT_GROUP = GROUP_SIZE if ALGORITHM != "REINFORCE" else 1
-    val_tag = f"valSeed{VAL_SEED}" if USE_FIXED_VAL else "valRandom"
 
-    # one flat name builder for every algorithm: whatever can differ between two sweep runs
-    # (algorithm, group size, lr, seed) has to be in the name, or W&B and the .pth files collide
-    run_name = f"RL_{algo_config}_G{CURRENT_GROUP}_{D}x{D}_lr{LEARNING_RATE:g}_s{SEED}-{val_tag}"
+    # every knob a sweep can vary has to be in BOTH names. group size, batch size, lr and the
+    # warm start all vary this week -> leave one out and two runs share a .pth, and the later
+    # run silently overwrites the earlier one's weights. val_tag dropped: it never varies and
+    # it's already in the config, it was only making the W&B legend truncate
+    run_name = f"RL_{algo_config}_G{CURRENT_GROUP}_B{BATCH_SIZE}_{D}x{D}_lr{LEARNING_RATE:g}_s{SEED}"
+
     if USE_CRITIC:
         # "MaxRL" and "MaxRL + learned V" must never share a run name or a .pth file
         algo_config += "_V"
@@ -85,12 +89,16 @@ def train_reinforce(
         # twin - same algorithm, group size, and seed, so TAG is the only thing left
         # to separate them. Folding it into TAG means out_name picks it up automatically.
         TAG = f"{TAG}_c{IN_CHANNELS}" if TAG else f"c{IN_CHANNELS}"
+    if STARTER:
+        # warm-start sweep: tag the run with the BC rung it started from. maze_CNN_s225.pth -> ws_s225
+        ws = os.path.splitext(os.path.basename(STARTER))[0].replace("maze_CNN_", "ws_")
+        TAG = f"{TAG}_{ws}" if TAG else ws
     if TAG:
         run_name += f"-{TAG}"
 
-    # checkpoint filename mirrors the run name for the same reason: the old fixed
-    # maze_{ALGORITHM}.pth meant run 2 silently overwrote run 1's weights
-    out_name = f"maze_{algo_config}_G{CURRENT_GROUP}_{D}x{D}_s{SEED}" + (f"_{TAG}" if TAG else "") + ".pth"
+    # checkpoint filename carries the same fields as the run name, for the same reason
+    out_name = (f"maze_{algo_config}_G{CURRENT_GROUP}_B{BATCH_SIZE}_{D}x{D}_lr{LEARNING_RATE:g}_s{SEED}"
+                + (f"_{TAG}" if TAG else "") + ".pth")
 
     # Dependent Reference Counts
     TOTAL_ENVS = TOTAL_UPDATES * BATCH_SIZE # Num mazes
@@ -171,6 +179,16 @@ def train_reinforce(
     t_start = time.time()
     t_last_report = t_start
 
+    # divergence guard for the lr sweep. a high-lr run that crashes at update 400 would otherwise
+    # burn its remaining budget producing garbage, and we'd be eyeballing which runs "crashed"
+    CRASH_WARMUP = 200  # updates before the collapse check arms -> the 100-update window has to fill first
+    CRASH_DROP = 20.0   # points below the run's own best rolling success that count as a collapse
+    # second check, for runs that die before they ever have a "best": the CPU pilot's GRPO at lr 3.2e-3
+    # learned to never STOP within 5 updates and sat at 0% for the whole run without tripping CRASH_DROP
+    CRASH_WARMUP_START = 50
+    best_rolling = 0.0
+    crashed, crash_reason = False, ""
+    
     print("Beginning on-policy RL optimization loop...") 
 
     for update in range(TOTAL_UPDATES):
@@ -222,6 +240,13 @@ def train_reinforce(
             # THE win: a single batched forward for all N rollouts instead of N tiny batch-1 ones
             logits, state_value = model(state_tensor, need_critic=need_critic)
 
+            # a diverged run shows up HERE first: the bad step already wrote NaN/inf into the weights,
+            # and Categorical() raises on non-finite logits before any loss exists to check. flag it
+            # and bail out of this rollout; the update loop breaks right after
+            if not torch.isfinite(logits).all():
+                crashed, crash_reason = True, "nonfinite_logits"
+                break
+
             # create sampling distribution from our logits + sample from it
             # logits= lets torch do the softmax (same as softmax with dim=-1 since logits is (N, 5))
             # -> this is why we're using torch distribution btw, so we don't have to write logprob and entropy functions ourselves
@@ -250,6 +275,11 @@ def train_reinforce(
 
             rew_steps.append(torch.from_numpy(shaped).to(device)) # per-step negative reward shaping
             mask_steps.append(torch.from_numpy(active.astype(np.float32)).to(device)) # 1 while alive
+
+        if crashed:
+            # the rollout loop above only exits one level; this leaves the update loop too
+            print(f"[crash] non-finite logits at update {global_step}", flush=True)
+            break
 
         # stack the time buffers into (T, N)
         # Explanation of torch.stack()
@@ -400,6 +430,13 @@ def train_reinforce(
             # Sharing loss backprop for efficiency, learning the same representation of the maze
             loss = loss + CRITIC_COEFF * value_term
 
+        # a NaN/inf loss means the next step writes NaN into every weight. checked BEFORE backward
+        # so the saved checkpoint is the last good one, not a NaN tensor
+        if not torch.isfinite(loss):
+            crashed, crash_reason = True, "nonfinite_loss"
+            print(f"[crash] non-finite loss at update {global_step}", flush=True)
+            break
+
         # whole batch is one graph now, so it's a single backward + step
         # (replaces the old gradient accumulation: /BATCH_SIZE so summed grads = MEAN grad over the batch)
         optimizer.zero_grad()
@@ -426,6 +463,28 @@ def train_reinforce(
         # Create rolling window
         rolling_window = success_history[-100:] # go from last 100 to end
         rolling_success_rate = np.mean(rolling_window) * 100
+
+        # collapse = rolling success falls 20+ points below this run's own best. far outside noise:
+        # per-update success moves a few points from maze sampling alone, and the 100-update mean
+        # cuts that ~10x. best only tracked once the window is full so one lucky early update
+        # can't set an unreachable bar
+        if global_step >= 100:
+            best_rolling = max(best_rolling, rolling_success_rate)
+        if global_step >= CRASH_WARMUP and rolling_success_rate < best_rolling - CRASH_DROP:
+            crashed, crash_reason = True, "collapse"
+            print(f"[crash] rolling success {rolling_success_rate:.1f} fell from best "
+                  f"{best_rolling:.1f} at update {global_step}", flush=True)
+            break
+        # update 1's rollouts ran BEFORE any gradient step, so success_history[0] is the warm start's own
+        # success. falling below half of it means the run destroyed the policy it started from.
+        # skipped for weak starts (<10%) where half of a tiny number is just noise
+        start_success = success_history[0] * 100
+        if (global_step >= CRASH_WARMUP_START and start_success >= 10.0
+                and rolling_success_rate < 0.5 * start_success):
+            crashed, crash_reason = True, "collapse_below_start"
+            print(f"[crash] rolling success {rolling_success_rate:.1f} is under half the warm start's "
+                  f"{start_success:.1f} at update {global_step}", flush=True)
+            break
 
         # is the critic predicting THIS maze's difficulty, or just the global success rate?
         # (most meaningful at G>1, where k_grp is a real rate rather than a single 0/1 draw)
@@ -507,26 +566,96 @@ def train_reinforce(
             t_last_report = now
 
     
+    # the analysis reads these to tell "crashed" from "stalled" without eyeballing curves
+    wandb.run.summary["crashed"] = crashed
+    wandb.run.summary["crash_reason"] = crash_reason
+    wandb.run.summary["final_global_step"] = global_step
+    wandb.run.summary["best_rolling_success"] = best_rolling
+
     # final save - out_path resolved up top so the mid-run snapshot could share it
     torch.save(model.state_dict(), out_path)
-    print(f"{run_name} complete. Weights saved to {out_path}!")
+    status = f"CRASHED ({crash_reason}) at update {global_step}" if crashed else "complete"
+    print(f"{run_name} {status}. Weights saved to {out_path}")
 
     wandb.finish()
     # handed back so the sweep driver can record which checkpoint belongs to which config
     return run_name, out_path
 
 if __name__ == "__main__":
-    SWEEP = "crossover_long_v1"
-    SEEDS = [0] # one seed first, add 1/2 once the crossover actually shows up
-    # G=32 - B=32 keeps 32 groups per update, which is
-    # what makes the per-update pass@32 readable -> N = 1024 rollouts/update, 4x last sweep
-    COMMON = {"TOTAL_UPDATES": 8000, "EVAL_INTERVAL": 50, "BATCH_SIZE": 32, "GROUP_SIZE": 32}
-    RUNS = [
-        # the deliverable — where does MaxRL's pass@1 cross GRPO's? ordered first so a dropped
-        # Colab session still leaves us the one result Week 8 actually asked for
-        {"ALGORITHM": "GRPO"},
-        {"ALGORITHM": "MaxRL"},
-    ]
+    import itertools
+    ALGOS = ["GRPO", "MaxRL"]
+
+    # every sweep is rollout-matched: BATCH_SIZE * GROUP_SIZE is fixed, so per-update compute stays
+    # ~flat and the knob under study is the only thing that changes between runs.
+    # 1024 = the Colab scale Week 8 ran at, 256 = the laptop pilot scale (~11 min/run on the i7)
+    N_GPU, N_CPU = 1024, 256
+
+    def by_group(Gs, n, **extra):
+        # G and B move together so B*G stays at n
+        return [{"ALGORITHM": a, "GROUP_SIZE": g, "BATCH_SIZE": n // g, **extra}
+                for g, a in itertools.product(Gs, ALGOS)]
+
+    # BC ladder rungs, held-out mean@1 before any RL (assets/ladder_probe.json):
+    # s0 1.6% (untrained), s225 18.4%, s250 29.0%, s275 42.2%. the default starter (s300) is 40.4%.
+    # s225 first: weakest start that still learned in the pilot, so a MaxRL edge should show there
+    # first. s275 last since it's ~the default starter, which Week 8 already ran
+    WARM_STARTS = [225, 0, 250, 275]
+
+    # laptop grid, lr x4 apart from "dead by update 50" down to "too small to move in 400 updates".
+    # crash end first: those runs die early, so they're cheap and sure to finish. stall end last: every
+    # one goes the full 400 updates, and if the night runs short the lowest lr is the one to lose
+    LRS_GRID = [1.28e-2, 3.2e-3, 8e-4, 2e-4, 5e-5, 1.25e-5, 3.125e-6, 7.8125e-7]
+    # (G, lr) cells the first CPU pilot already ran with these exact settings -> in W&B under the
+    # cpu_* groups. same code, same seed, so rerunning them is ~4h of laptop for no new information
+    PILOT_DONE = ({(g, 5e-5) for g in (4, 8, 16, 32)}
+                  | {(16, lr) for lr in (1.25e-5, 2e-4, 8e-4, 3.2e-3)}
+                  | {(g, lr) for g in (4, 32) for lr in (2e-4, 8e-4)})
+    PILOT = {"TOTAL_UPDATES": 400, "EVAL_INTERVAL": 100, "LOG_INTERVAL": 5, "NUM_VAL_MAZES": 50, "TAG": "cpu"}
+
+    def grid_cells(algo, lrs):
+        return [{"ALGORITHM": algo, "GROUP_SIZE": g, "BATCH_SIZE": N_CPU // g, "LEARNING_RATE": lr}
+                for lr in lrs for g in (4, 8, 16, 32) if (g, lr) not in PILOT_DONE]
+
+    SWEEPS = {
+        # ---- Colab (T4, ~0.37 s/update at 1024 rollouts -> ~30 min per 5000-update run) ----
+        # A. best group size for each algorithm at fixed compute. runs first on Colab: it's the one the
+        # laptop can't answer at full scale. extremes first; G=32 last since that's Week 8's crossover config
+        "groupsize_v1": dict(common={"TOTAL_UPDATES": 5000},
+                             runs=by_group([4, 64, 8, 16, 32], N_GPU)),
+        # B. does MaxRL gain more than GRPO from a WORSE warm start? the pilot-scale version already exists
+        "warmstart_v1": dict(common={"TOTAL_UPDATES": 5000, "GROUP_SIZE": 32, "BATCH_SIZE": 32},
+                             runs=[{"ALGORITHM": a, "STARTER": f"maze_CNN_s{s}.pth"}
+                                   for s, a in itertools.product(WARM_STARTS, ALGOS)]),
+        # C. the crash edge at full scale, 3 seeds -> a collapse RATE, not one coin flip.
+        # the pilot put GRPO's edge at 3.2e-3 (2 of 3 seeds) and MaxRL's at 6.4e-3
+        "lr_edge_v1": dict(common={"TOTAL_UPDATES": 3000, "GROUP_SIZE": 32, "BATCH_SIZE": 32}, seeds=[0, 1, 2],
+                           runs=[{"ALGORITHM": a, "LEARNING_RATE": lr}
+                                 for lr, a in itertools.product([1.6e-3, 3.2e-3, 6.4e-3], ALGOS)]),
+        # ---- laptop, pilot scale. one algorithm per terminal: both get ~the same work, and a short
+        # night still leaves matched GRPO/MaxRL cells instead of one finished half ----
+        # D. G x lr grid (the 24 PILOT_DONE cells come from the first pilot)
+        "grid_cpu_GRPO": dict(common=PILOT, runs=grid_cells("GRPO", LRS_GRID)),
+        "grid_cpu_MaxRL": dict(common=PILOT, runs=grid_cells("MaxRL", LRS_GRID)),
+        # D2. GRPO's edge on seeds 1-2 -> a collapse rate per G. GRPO only: it's the one that dies at
+        # 3.2e-3, and most of its runs end by update 50, so this fits after grid_cpu_GRPO
+        "grid_cpu_seeds": dict(common=PILOT, seeds=[1, 2],
+                               runs=[{"ALGORITHM": "GRPO", "GROUP_SIZE": g, "BATCH_SIZE": N_CPU // g,
+                                      "LEARNING_RATE": 3.2e-3} for g in (4, 8, 16, 32)]),
+        # ~2 min on the laptop: checks the names, the training loop and the crash path before committing hours
+        "smoke": dict(common={"TOTAL_UPDATES": 60, "EVAL_INTERVAL": 30, "NUM_VAL_MAZES": 10,
+                              "GROUP_SIZE": 4, "BATCH_SIZE": 8, "TAG": "smoke"},
+                      runs=[{"ALGORITHM": a} for a in ALGOS]
+                           + [{"ALGORITHM": "GRPO", "LEARNING_RATE": 1.28e-2}]),
+    }
+
+    # pick the experiment from the shell -> no edit + push between sessions:
+    #   SWEEP=groupsize_v1 python -u train-reinforce.py
+    # default is the smoke test, so a bare run can never start a 4-hour sweep by accident
+    SWEEP = os.environ.get("SWEEP", "smoke")
+    COMMON = {"EVAL_INTERVAL": 50, **SWEEPS[SWEEP]["common"]}
+    RUNS = SWEEPS[SWEEP]["runs"]
+    # one seed by default. near the crash edge one seed can't tell you a collapse rate
+    SEEDS = SWEEPS[SWEEP].get("seeds", [0])
 
     out_dir = "checkpoints" if os.path.isdir("checkpoints") else "."
     manifest_path = os.path.join(out_dir, f"runs_{SWEEP}.json")
@@ -557,4 +686,3 @@ if __name__ == "__main__":
                 json.dump(manifest, f, indent=2)
 
     print(f"\nSweep done: {len(manifest)} runs recorded -> {manifest_path}")
-
